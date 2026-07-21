@@ -138,89 +138,132 @@ function shuffle (values) {
   return result
 }
 
-function captchaText (expected, progress) {
-  return `人机验证：请依次点击 ${expected.join(' → ')}\n有效期 2 分钟。当前进度：${progress}/2`
+function captchaText (expected) {
+  return `人机验证：请选择 ${expected.join(' → ')}\n有效期 2 分钟。`
+}
+
+function createCaptcha (chatId, failures = 0, messageId = null) {
+  const expected = shuffle(ICONS).slice(0, 2)
+  const correctCombination = expected.join(':')
+  const distractors = []
+  for (const first of ICONS) {
+    for (const second of ICONS) {
+      const combination = `${first}:${second}`
+      if (first !== second && combination !== correctCombination) distractors.push([first, second])
+    }
+  }
+  const combinations = shuffle([expected, ...shuffle(distractors).slice(0, 5)])
+  const options = combinations.map((icons, index) => ({ id: index.toString(), icons }))
+  const correctOptionId = options.find(option => option.icons.join(':') === correctCombination).id
+  return {
+    id: crypto.randomUUID(),
+    expected,
+    options,
+    correctOptionId,
+    failures,
+    expiresAt: Date.now() + CAPTCHA_TTL_SECONDS * 1000,
+    chatId,
+    messageId
+  }
+}
+
+function captchaKeyboard (challenge) {
+  const buttons = challenge.options.map(option => ({
+    text: option.icons.join(' → '),
+    callback_data: `captcha:${challenge.id}:${option.id}`
+  }))
+  return { inline_keyboard: [buttons.slice(0, 2), buttons.slice(2, 4), buttons.slice(4)] }
 }
 
 async function ensureCaptcha (message) {
   const uid = message.from.id.toString()
   const key = 'captcha-' + uid
   const existing = await nfd.get(key, { type: 'json' })
-  if (existing && existing.expiresAt > Date.now()) return
+  if (existing?.messageId && existing.expiresAt > Date.now()) return
+  const failures = existing?.expiresAt > Date.now() ? existing.failures || 0 : 0
+  if (existing) await nfd.delete(key)
 
-  const expected = shuffle(ICONS).slice(0, 2)
-  const challenge = {
-    id: crypto.randomUUID(),
-    expected,
-    progress: 0,
-    failures: 0,
-    expiresAt: Date.now() + CAPTCHA_TTL_SECONDS * 1000,
-    chatId: message.chat.id
-  }
-  const keyboard = shuffle(ICONS).map(icon => ({
-    text: icon,
-    callback_data: `captcha:${challenge.id}:${icon}`
-  }))
+  const challenge = createCaptcha(message.chat.id, failures)
   await nfd.put(key, JSON.stringify(challenge), { expirationTtl: CAPTCHA_TTL_SECONDS })
-  const response = await sendMessage({
-    chat_id: message.chat.id,
-    text: captchaText(expected, 0),
-    reply_markup: { inline_keyboard: [keyboard.slice(0, 3), keyboard.slice(3)] }
-  })
-  if (response.ok) {
+  try {
+    const response = await sendMessage({
+      chat_id: message.chat.id,
+      text: captchaText(challenge.expected),
+      reply_markup: captchaKeyboard(challenge)
+    })
+    if (!response.ok || !response.result?.message_id) {
+      await nfd.delete(key)
+      return
+    }
     challenge.messageId = response.result.message_id
     await nfd.put(key, JSON.stringify(challenge), { expirationTtl: CAPTCHA_TTL_SECONDS })
+  } catch (error) {
+    await nfd.delete(key)
+    throw error
   }
 }
 
 async function onCallbackQuery (query) {
-  // Telegram requires every callback to be acknowledged, even when it is ignored.
-  await answerCallbackQuery(query.id)
-  if (query.message?.chat?.type !== 'private') return
+  try {
+    if (query.message?.chat?.type !== 'private') return
 
-  const uid = query.from.id.toString()
-  if (uid === ADMIN_UID) return
-  if (await nfd.get('isblocked-' + uid, { type: 'json' })) return
-  if (await isTemporarilyRestricted(uid)) return
+    const uid = query.from.id.toString()
+    if (uid === ADMIN_UID) return
+    if (await nfd.get('isblocked-' + uid, { type: 'json' })) return
+    if (await isTemporarilyRestricted(uid)) return
 
-  const stateKey = 'captcha-' + uid
-  const state = await nfd.get(stateKey, { type: 'json' })
-  if (!state || state.expiresAt <= Date.now() || state.chatId.toString() !== query.message.chat.id.toString()) return
+    const stateKey = 'captcha-' + uid
+    const state = await nfd.get(stateKey, { type: 'json' })
+    if (!state || !state.messageId || state.expiresAt <= Date.now()) return
+    if (state.chatId.toString() !== query.message.chat.id.toString() || state.messageId !== query.message.message_id) return
 
-  const parts = (query.data || '').split(':')
-  if (parts.length !== 3 || parts[0] !== 'captcha' || parts[1] !== state.id) return
+    const parts = (query.data || '').split(':')
+    if (parts.length !== 3 || parts[0] !== 'captcha' || parts[1] !== state.id) return
+    const selectedOption = state.options.find(option => option.id === parts[2])
+    if (!selectedOption) return
 
-  const selectedIcon = parts[2]
-  if (selectedIcon !== state.expected[state.progress]) {
-    state.failures += 1
-    state.progress = 0
-    if (state.failures >= 3) {
-      await nfd.put('captcha-block-' + uid, 'true', { expirationTtl: CAPTCHA_BLOCK_SECONDS })
-      await nfd.delete(stateKey)
+    if (selectedOption.id !== state.correctOptionId) {
+      const failures = state.failures + 1
+      if (failures >= 3) {
+        await nfd.put('captcha-block-' + uid, 'true', { expirationTtl: CAPTCHA_BLOCK_SECONDS })
+        await nfd.delete(stateKey)
+        return
+      }
+
+      // Saving a new challenge first makes every button from the previous challenge stale.
+      const replacement = createCaptcha(state.chatId, failures, state.messageId)
+      await nfd.put(stateKey, JSON.stringify(replacement), { expirationTtl: CAPTCHA_TTL_SECONDS })
+      try {
+        const response = await editMessageText({
+          chat_id: state.chatId,
+          message_id: state.messageId,
+          text: captchaText(replacement.expected),
+          reply_markup: captchaKeyboard(replacement)
+        })
+        if (!response.ok) {
+          replacement.messageId = null
+          await nfd.put(stateKey, JSON.stringify(replacement), { expirationTtl: CAPTCHA_TTL_SECONDS })
+        }
+      } catch (error) {
+        replacement.messageId = null
+        await nfd.put(stateKey, JSON.stringify(replacement), { expirationTtl: CAPTCHA_TTL_SECONDS })
+        throw error
+      }
       return
     }
-    await saveCaptcha(stateKey, state)
-    return
+
+    await nfd.put('verified-' + uid, 'true')
+    await nfd.delete(stateKey)
+    await editMessageText({
+      chat_id: query.message.chat.id,
+      message_id: query.message.message_id,
+      text: '验证成功，现在可以发送消息了。',
+      reply_markup: { inline_keyboard: [] }
+    })
+  } finally {
+    // Telegram requires every callback to be acknowledged, including ignored stale callbacks.
+    await answerCallbackQuery(query.id)
   }
-
-  state.progress += 1
-  if (state.progress < state.expected.length) {
-    await saveCaptcha(stateKey, state)
-    return
-  }
-
-  await nfd.put('verified-' + uid, 'true')
-  await nfd.delete(stateKey)
-  await editMessageText({
-    chat_id: query.message.chat.id,
-    message_id: query.message.message_id,
-    text: '验证成功，现在可以发送消息了。'
-  })
-}
-
-async function saveCaptcha (key, state) {
-  const remaining = Math.ceil((state.expiresAt - Date.now()) / 1000)
-  if (remaining > 0) await nfd.put(key, JSON.stringify(state), { expirationTtl: Math.max(60, remaining) })
 }
 
 async function isTemporarilyRestricted (uid) {
@@ -248,20 +291,20 @@ async function isRateLimited (uid) {
   ])
   if (nextMinuteCount <= 5 && nextHourCount <= 20) return false
 
-  const strikeKey = 'rate-strikes-' + uid
-  const strikes = await nfd.get(strikeKey, { type: 'json' }) || { count: 0, expiresAt: now + 3600000 }
-  if (strikes.expiresAt <= now) {
-    strikes.count = 0
-    strikes.expiresAt = now + 3600000
-  }
-  strikes.count += 1
-  if (strikes.count >= 3) {
+  const hitKey = `rate-hit-${uid}-${minuteWindow}`
+  const alreadyHit = await nfd.get(hitKey, { type: 'json' })
+  if (alreadyHit) return true
+  await nfd.put(hitKey, 'true', { expirationTtl: 3600 })
+
+  // Per-minute marker keys are idempotent: concurrent requests may be observed late,
+  // but they cannot create more than one strike for the same minute window.
+  const previousHitKeys = Array.from({ length: 59 }, (_, offset) =>
+    `rate-hit-${uid}-${minuteWindow - offset - 1}`
+  )
+  const previousHits = await Promise.all(previousHitKeys.map(key => nfd.get(key, { type: 'json' })))
+  const distinctHitCount = 1 + previousHits.filter(Boolean).length
+  if (distinctHitCount >= 3) {
     await nfd.put('rate-block-' + uid, 'true', { expirationTtl: RATE_BLOCK_SECONDS })
-    await nfd.delete(strikeKey)
-  } else {
-    await nfd.put(strikeKey, JSON.stringify(strikes), {
-      expirationTtl: Math.max(60, Math.ceil((strikes.expiresAt - now) / 1000))
-    })
   }
   return true
 }
