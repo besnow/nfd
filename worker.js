@@ -54,6 +54,10 @@ function editMessageText (msg) {
   return requestTelegram('editMessageText', makeReqBody(msg))
 }
 
+function deleteMessage (msg) {
+  return requestTelegram('deleteMessage', makeReqBody(msg))
+}
+
 addEventListener('fetch', event => {
   const url = new URL(event.request.url)
   if (url.pathname === WEBHOOK) {
@@ -142,7 +146,8 @@ function captchaText (expected) {
   return `人机验证：请选择 ${expected.join(' → ')}\n有效期 2 分钟。`
 }
 
-function createCaptcha (chatId, failures = 0, messageId = null) {
+function createCaptcha (chatId, failures = 0, messageId = null, status = 'pending') {
+  const now = Date.now()
   const expected = shuffle(ICONS).slice(0, 2)
   const correctCombination = expected.join(':')
   const distractors = []
@@ -161,7 +166,9 @@ function createCaptcha (chatId, failures = 0, messageId = null) {
     options,
     correctOptionId,
     failures,
-    expiresAt: Date.now() + CAPTCHA_TTL_SECONDS * 1000,
+    status,
+    createdAt: now,
+    expiresAt: now + CAPTCHA_TTL_SECONDS * 1000,
     chatId,
     messageId
   }
@@ -179,9 +186,10 @@ async function ensureCaptcha (message) {
   const uid = message.from.id.toString()
   const key = 'captcha-' + uid
   const existing = await nfd.get(key, { type: 'json' })
-  if (existing?.messageId && existing.expiresAt > Date.now()) return
+  const now = Date.now()
+  if (existing?.status === 'active' && existing.messageId && existing.expiresAt > now) return
+  if (existing?.status === 'pending' && existing.expiresAt > now && now - existing.createdAt < 10000) return
   const failures = existing?.expiresAt > Date.now() ? existing.failures || 0 : 0
-  if (existing) await nfd.delete(key)
 
   const challenge = createCaptcha(message.chat.id, failures)
   await nfd.put(key, JSON.stringify(challenge), { expirationTtl: CAPTCHA_TTL_SECONDS })
@@ -192,15 +200,26 @@ async function ensureCaptcha (message) {
       reply_markup: captchaKeyboard(challenge)
     })
     if (!response.ok || !response.result?.message_id) {
-      await nfd.delete(key)
+      await deleteCaptchaIfCurrent(key, challenge.id)
       return
     }
+    const current = await nfd.get(key, { type: 'json' })
+    if (current?.id !== challenge.id) {
+      await deleteMessage({ chat_id: message.chat.id, message_id: response.result.message_id })
+      return
+    }
+    challenge.status = 'active'
     challenge.messageId = response.result.message_id
     await nfd.put(key, JSON.stringify(challenge), { expirationTtl: CAPTCHA_TTL_SECONDS })
   } catch (error) {
-    await nfd.delete(key)
+    await deleteCaptchaIfCurrent(key, challenge.id)
     throw error
   }
+}
+
+async function deleteCaptchaIfCurrent (key, challengeId) {
+  const current = await nfd.get(key, { type: 'json' })
+  if (current?.id === challengeId) await nfd.delete(key)
 }
 
 async function onCallbackQuery (query) {
@@ -214,7 +233,7 @@ async function onCallbackQuery (query) {
 
     const stateKey = 'captcha-' + uid
     const state = await nfd.get(stateKey, { type: 'json' })
-    if (!state || !state.messageId || state.expiresAt <= Date.now()) return
+    if (!state || state.status !== 'active' || !state.messageId || state.expiresAt <= Date.now()) return
     if (state.chatId.toString() !== query.message.chat.id.toString() || state.messageId !== query.message.message_id) return
 
     const parts = (query.data || '').split(':')
@@ -226,12 +245,12 @@ async function onCallbackQuery (query) {
       const failures = state.failures + 1
       if (failures >= 3) {
         await nfd.put('captcha-block-' + uid, 'true', { expirationTtl: CAPTCHA_BLOCK_SECONDS })
-        await nfd.delete(stateKey)
+        await deleteCaptchaIfCurrent(stateKey, state.id)
         return
       }
 
       // Saving a new challenge first makes every button from the previous challenge stale.
-      const replacement = createCaptcha(state.chatId, failures, state.messageId)
+      const replacement = createCaptcha(state.chatId, failures, state.messageId, 'active')
       await nfd.put(stateKey, JSON.stringify(replacement), { expirationTtl: CAPTCHA_TTL_SECONDS })
       try {
         const response = await editMessageText({
@@ -241,19 +260,17 @@ async function onCallbackQuery (query) {
           reply_markup: captchaKeyboard(replacement)
         })
         if (!response.ok) {
-          replacement.messageId = null
-          await nfd.put(stateKey, JSON.stringify(replacement), { expirationTtl: CAPTCHA_TTL_SECONDS })
+          await deleteCaptchaIfCurrent(stateKey, replacement.id)
         }
       } catch (error) {
-        replacement.messageId = null
-        await nfd.put(stateKey, JSON.stringify(replacement), { expirationTtl: CAPTCHA_TTL_SECONDS })
+        await deleteCaptchaIfCurrent(stateKey, replacement.id)
         throw error
       }
       return
     }
 
     await nfd.put('verified-' + uid, 'true')
-    await nfd.delete(stateKey)
+    await deleteCaptchaIfCurrent(stateKey, state.id)
     await editMessageText({
       chat_id: query.message.chat.id,
       message_id: query.message.message_id,
@@ -291,20 +308,17 @@ async function isRateLimited (uid) {
   ])
   if (nextMinuteCount <= 5 && nextHourCount <= 20) return false
 
-  const hitKey = `rate-hit-${uid}-${minuteWindow}`
-  const alreadyHit = await nfd.get(hitKey, { type: 'json' })
-  if (alreadyHit) return true
-  await nfd.put(hitKey, 'true', { expirationTtl: 3600 })
+  const strikeKey = `rate-strikes-${uid}`
+  const strikeState = await nfd.get(strikeKey, { type: 'json' }) || { windows: [] }
+  const recentWindows = strikeState.windows.filter(window => window > minuteWindow - 60)
+  const windows = [...new Set(recentWindows)]
+  if (!windows.includes(minuteWindow)) windows.push(minuteWindow)
 
-  // Per-minute marker keys are idempotent: concurrent requests may be observed late,
-  // but they cannot create more than one strike for the same minute window.
-  const previousHitKeys = Array.from({ length: 59 }, (_, offset) =>
-    `rate-hit-${uid}-${minuteWindow - offset - 1}`
-  )
-  const previousHits = await Promise.all(previousHitKeys.map(key => nfd.get(key, { type: 'json' })))
-  const distinctHitCount = 1 + previousHits.filter(Boolean).length
-  if (distinctHitCount >= 3) {
+  if (windows.length >= 3) {
     await nfd.put('rate-block-' + uid, 'true', { expirationTtl: RATE_BLOCK_SECONDS })
+    await nfd.delete(strikeKey)
+  } else {
+    await nfd.put(strikeKey, JSON.stringify({ windows }), { expirationTtl: 3600 })
   }
   return true
 }
