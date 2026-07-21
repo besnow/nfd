@@ -23,6 +23,7 @@ No Fraud / Node Forward Bot
     - 稳定，全球cdn转发
 - 接入反欺诈系统，当聊天对象有诈骗历史时，自动发出提醒
 - 支持屏蔽用户，避免被骚扰
+- 仅接收 Telegram 私聊消息，并通过双图标验证、UID 限速和静默封禁减少骚扰
 
 ## 搭建方法
 1. 从[@BotFather](https://t.me/BotFather)获取token，并且可以发送`/setjoingroups`来禁止此Bot被添加到群组
@@ -35,12 +36,65 @@ No Fraud / Node Forward Bot
     - 增加一个`ENV_ADMIN_UID`变量，数值为从步骤3中获得的用户id
 6. 绑定kv数据库，创建一个Namespace Name为`nfd`的kv数据库，在setting -> variable中设置`KV Namespace Bindings`：nfd -> nfd
 7. 点击`Quick Edit`，复制[这个文件](./worker.js)到编辑器中
-8. 通过打开`https://xxx.workers.dev/registerWebhook`来注册websoket
+8. 部署后使用下面的命令注册 Webhook。管理接口只接受 `POST`，并要求与
+   `ENV_BOT_SECRET` 完全一致的 Bearer Token（不要把真实密钥提交到仓库或 shell 历史）：
+
+   ```bash
+   read -rsp 'ENV_BOT_SECRET: ' BOT_SECRET && echo
+   curl --fail-with-body -X POST \
+     -H "Authorization: Bearer ${BOT_SECRET}" \
+     https://xxx.workers.dev/registerWebhook
+   unset BOT_SECRET
+   ```
+
+   如需取消 Webhook，使用相同的认证方式：
+
+   ```bash
+   read -rsp 'ENV_BOT_SECRET: ' BOT_SECRET && echo
+   curl --fail-with-body -X POST \
+     -H "Authorization: Bearer ${BOT_SECRET}" \
+     https://xxx.workers.dev/unRegisterWebhook
+   unset BOT_SECRET
+   ```
 
 ## 使用方法
 - 当其他用户给bot发消息，会被转发到bot创建者
 - 用户回复普通文字给转发的消息时，会回复到原消息发送者
 - 用户回复`/block`, `/unblock`, `/checkblock`等命令会执行相关指令，**不会**回复到原消息发送者
+- 群组、超级群组和频道消息会被忽略；管理员 UID 不需要验证，也不受访客限速影响
+- 陌生用户首次发送 `/start`（或其他消息）时会收到双图标顺序验证。用户需按提示依次从
+  随机排列的 6 个按钮中选择图标，验证题 2 分钟内有效；有效题目存在时不会重复发送新题。
+  验证成功后才会向管理员转发消息，以后也不需要重复验证
+- 连续选错 3 次会被静默限制 1 小时；永久屏蔽、临时限制或超过限速的消息都会被静默丢弃
+
+## 防骚扰限速
+
+限速按 Telegram UID 计算，管理员除外：
+
+- 每分钟最多处理 5 条消息
+- 每小时最多处理 20 条消息
+- 超额消息不作回复，也不会转发
+- 一小时内累计触发 3 次限速后，该 UID 会被静默封禁 24 小时
+
+Cloudflare KV 是最终一致性存储，因此极高并发下计数可能存在短暂偏差；这些限制主要用于普通的
+机器人私聊防骚扰场景。
+
+## KV 数据
+
+继续使用现有的 `nfd` KV 绑定，不需要增加依赖或新的 Namespace。主要键如下：
+
+| 键 | 内容与有效期 |
+| --- | --- |
+| `verified-{UID}` | 已通过验证的标记，永久保存 |
+| `captcha-{UID}` | 当前题目的随机 ID、正确图标顺序、当前进度、失败次数、聊天/消息信息和过期时间，2 分钟 |
+| `captcha-block-{UID}` | 连续验证失败后的静默限制，1 小时 |
+| `rate-minute-{UID}-{窗口}` | 分钟窗口消息计数（键额外保留约 2 分钟） |
+| `rate-hour-{UID}-{窗口}` | 小时窗口消息计数（键额外保留约 2 小时） |
+| `rate-strikes-{UID}` | 一小时内限速触发次数和过期时间 |
+| `rate-block-{UID}` | 达到 3 次限速触发后的静默封禁，24 小时 |
+| `isblocked-{UID}` | 管理员通过 `/block` 设置的永久屏蔽状态 |
+| `msg-map-{消息ID}` | 转发给管理员的消息 ID 到访客 chat ID 的映射；管理员回复依赖此键 |
+| `lastmsg-{UID}` | 上一次向管理员发送安全提醒的时间 |
 
 ## 欺诈数据源
 - 文件[fraud.db](./fraud.db)为欺诈数据，格式为每行一个uid
