@@ -70,7 +70,11 @@ No Fraud / Node Forward Bot
 - 验证码创建时先以 `pending` 状态写入 KV，10 秒内的并发消息会复用该创建过程；Telegram
   成功返回消息 ID 后才切换为 `active`。超过 10 秒仍为 `pending` 的异常题目才允许重新创建
 - 每次选错都会立即换成新题目并使旧按钮失效；连续答错 3 道题会被静默限制 1 小时。
+  新题继承当前验证会话的原始过期时间，不会因答错重新开始 10 分钟。
   永久屏蔽、临时限制或超过限速的消息都会被静默丢弃
+- 正确答案回调先移除按钮并将 Telegram 消息改为“验证处理中”，只有成功完成该编辑的回调才会转发消息，
+  防止快速重复点击导致重复转发。处理状态超过 30 秒后可重新创建验证，不会永久卡住。转发成功后，管理员回复映射最多写入 3 次；
+  映射失败不会被误报为转发失败。
 
 ## 防骚扰限速
 
@@ -95,7 +99,7 @@ No Fraud / Node Forward Bot
 | --- | --- |
 | `verified-{UID}` | 已通过验证的标记，永久保存 |
 | `captcha-{UID}` | 当前算术题的随机 ID、UID、`createdAt`、`pending`/`active`/`processing` 状态、3 个数字选项、正确选项 ID、失败次数、聊天/消息信息和过期时间，10 分钟 |
-| `pending-message-{UID}` | 验证前第一条非 `/start` 消息的 chat ID 和 message ID，10 分钟；验证完成后删除 |
+| `pending-message-{UID}` | 验证前第一条非 `/start` 消息的 chat ID 和 message ID；TTL 与当前验证会话的原始过期时间同步，验证完成后删除 |
 | `captcha-block-{UID}` | 连续验证失败后的静默限制，1 小时 |
 | `rate-minute-{UID}-{窗口}` | 分钟窗口消息计数（键额外保留约 2 分钟） |
 | `rate-hour-{UID}-{窗口}` | 小时窗口消息计数（键额外保留约 2 小时） |
