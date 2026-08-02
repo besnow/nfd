@@ -4,10 +4,9 @@ const SECRET = ENV_BOT_SECRET // A-Z, a-z, 0-9, _ and -
 const ADMIN_UID = ENV_ADMIN_UID.toString() // your user id, get it from https://t.me/username_to_id_bot
 
 const NOTIFY_INTERVAL = 3600 * 1000
-const CAPTCHA_TTL_SECONDS = 2 * 60
+const CAPTCHA_TTL_SECONDS = 10 * 60
 const CAPTCHA_BLOCK_SECONDS = 60 * 60
 const RATE_BLOCK_SECONDS = 24 * 60 * 60
-const ICONS = ['🍎', '🍋', '🍇', '🍒', '🥕', '🌻']
 const fraudDb = 'https://raw.githubusercontent.com/LloydAsp/nfd/main/data/fraud.db'
 const notificationUrl = 'https://raw.githubusercontent.com/LloydAsp/nfd/main/data/notification.txt'
 const startMsgUrl = 'https://raw.githubusercontent.com/LloydAsp/nfd/main/data/startMessage.md'
@@ -99,6 +98,7 @@ async function onMessage (message) {
 
   const verified = await nfd.get('verified-' + uid, { type: 'json' })
   if (!verified) {
+    if (message.text !== '/start') await savePendingMessage(message)
     await ensureCaptcha(message)
     return
   }
@@ -142,27 +142,37 @@ function shuffle (values) {
   return result
 }
 
-function captchaText (expected) {
-  return `人机验证：请选择 ${expected.join(' → ')}\n有效期 2 分钟。`
+function captchaText (challenge) {
+  return `为防止广告消息，请完成一个简单验证：\n${challenge.left} ${challenge.operator} ${challenge.right} = ?`
 }
 
-function createCaptcha (chatId, failures = 0, messageId = null, status = 'pending') {
+function createCaptcha (userId, chatId, failures = 0, messageId = null, status = 'pending') {
   const now = Date.now()
-  const expected = shuffle(ICONS).slice(0, 2)
-  const correctCombination = expected.join(':')
-  const distractors = []
-  for (const first of ICONS) {
-    for (const second of ICONS) {
-      const combination = `${first}:${second}`
-      if (first !== second && combination !== correctCombination) distractors.push([first, second])
+  const operator = Math.random() < 0.5 ? '+' : '-'
+  let left = Math.floor(Math.random() * 21)
+  let right = operator === '+'
+    ? Math.floor(Math.random() * (21 - left))
+    : Math.floor(Math.random() * 21)
+  if (operator === '-' && right > left) {
+    ;[left, right] = [right, left]
+  }
+  const answer = operator === '+' ? left + right : left - right
+  const candidates = []
+  for (let distance = 1; candidates.length < 2; distance++) {
+    const nearby = shuffle([answer - distance, answer + distance])
+    for (const value of nearby) {
+      if (value >= 0 && value !== answer && !candidates.includes(value)) candidates.push(value)
+      if (candidates.length === 2) break
     }
   }
-  const combinations = shuffle([expected, ...shuffle(distractors).slice(0, 5)])
-  const options = combinations.map((icons, index) => ({ id: index.toString(), icons }))
-  const correctOptionId = options.find(option => option.icons.join(':') === correctCombination).id
+  const options = shuffle([answer, ...candidates]).map((value, index) => ({ id: index.toString(), value }))
+  const correctOptionId = options.find(option => option.value === answer).id
   return {
     id: crypto.randomUUID(),
-    expected,
+    userId,
+    left,
+    right,
+    operator,
     options,
     correctOptionId,
     failures,
@@ -176,10 +186,19 @@ function createCaptcha (chatId, failures = 0, messageId = null, status = 'pendin
 
 function captchaKeyboard (challenge) {
   const buttons = challenge.options.map(option => ({
-    text: option.icons.join(' → '),
+    text: option.value.toString(),
     callback_data: `captcha:${challenge.id}:${option.id}`
   }))
-  return { inline_keyboard: [buttons.slice(0, 2), buttons.slice(2, 4), buttons.slice(4)] }
+  return { inline_keyboard: [buttons] }
+}
+
+async function savePendingMessage (message) {
+  const key = 'pending-message-' + message.from.id
+  if (await nfd.get(key, { type: 'json' })) return
+  await nfd.put(key, JSON.stringify({
+    chatId: message.chat.id,
+    messageId: message.message_id
+  }), { expirationTtl: CAPTCHA_TTL_SECONDS })
 }
 
 async function ensureCaptcha (message) {
@@ -191,12 +210,12 @@ async function ensureCaptcha (message) {
   if (existing?.status === 'pending' && existing.expiresAt > now && now - existing.createdAt < 10000) return
   const failures = existing?.expiresAt > Date.now() ? existing.failures || 0 : 0
 
-  const challenge = createCaptcha(message.chat.id, failures)
+  const challenge = createCaptcha(uid, message.chat.id, failures)
   await nfd.put(key, JSON.stringify(challenge), { expirationTtl: CAPTCHA_TTL_SECONDS })
   try {
     const response = await sendMessage({
       chat_id: message.chat.id,
-      text: captchaText(challenge.expected),
+      text: captchaText(challenge),
       reply_markup: captchaKeyboard(challenge)
     })
     if (!response.ok || !response.result?.message_id) {
@@ -234,6 +253,7 @@ async function onCallbackQuery (query) {
     const stateKey = 'captcha-' + uid
     const state = await nfd.get(stateKey, { type: 'json' })
     if (!state || state.status !== 'active' || !state.messageId || state.expiresAt <= Date.now()) return
+    if (state.userId?.toString() !== uid) return
     if (state.chatId.toString() !== query.message.chat.id.toString() || state.messageId !== query.message.message_id) return
 
     const parts = (query.data || '').split(':')
@@ -250,13 +270,13 @@ async function onCallbackQuery (query) {
       }
 
       // Saving a new challenge first makes every button from the previous challenge stale.
-      const replacement = createCaptcha(state.chatId, failures, state.messageId, 'active')
+      const replacement = createCaptcha(uid, state.chatId, failures, state.messageId, 'active')
       await nfd.put(stateKey, JSON.stringify(replacement), { expirationTtl: CAPTCHA_TTL_SECONDS })
       try {
         const response = await editMessageText({
           chat_id: state.chatId,
           message_id: state.messageId,
-          text: captchaText(replacement.expected),
+          text: captchaText(replacement),
           reply_markup: captchaKeyboard(replacement)
         })
         if (!response.ok) {
@@ -269,12 +289,37 @@ async function onCallbackQuery (query) {
       return
     }
 
+    // Invalidate the buttons before forwarding so repeated callbacks cannot resend the message.
+    state.status = 'processing'
+    await nfd.put(stateKey, JSON.stringify(state), { expirationTtl: CAPTCHA_TTL_SECONDS })
     await nfd.put('verified-' + uid, 'true')
-    await deleteCaptchaIfCurrent(stateKey, state.id)
+
+    const pendingKey = 'pending-message-' + uid
+    const pending = await nfd.get(pendingKey, { type: 'json' })
+    let resultText = '✅ 验证成功，请发送您的问题。'
+    if (pending) {
+      const forwarded = await forwardGuestMessage(pending.chatId, pending.messageId)
+      if (forwarded) {
+        resultText = '✅ 验证成功，您的消息已发送，请耐心等待回复。'
+      } else {
+        resultText = '✅ 验证成功，但原消息发送失败，请重新发送一次。'
+      }
+      await nfd.delete(pendingKey)
+      await deleteCaptchaIfCurrent(stateKey, state.id)
+      if (forwarded) {
+        try {
+          await handleNotify({ chat: { id: pending.chatId } })
+        } catch (error) {
+          console.log(`handleNotify failed: ${error}`)
+        }
+      }
+    } else {
+      await deleteCaptchaIfCurrent(stateKey, state.id)
+    }
     await editMessageText({
       chat_id: query.message.chat.id,
       message_id: query.message.message_id,
-      text: '验证成功，现在可以发送消息了。',
+      text: resultText,
       reply_markup: { inline_keyboard: [] }
     })
   } finally {
@@ -324,15 +369,24 @@ async function isRateLimited (uid) {
 }
 
 async function handleGuestMessage (message) {
-  const chatId = message.chat.id
-  const forwardReq = await forwardMessage({
-    chat_id: ADMIN_UID,
-    from_chat_id: chatId,
-    message_id: message.message_id
-  })
-  console.log(JSON.stringify(forwardReq))
-  if (forwardReq.ok) await nfd.put('msg-map-' + forwardReq.result.message_id, chatId)
-  return handleNotify(message)
+  const forwarded = await forwardGuestMessage(message.chat.id, message.message_id)
+  if (forwarded) return handleNotify(message)
+}
+
+async function forwardGuestMessage (chatId, messageId) {
+  try {
+    const forwardReq = await forwardMessage({
+      chat_id: ADMIN_UID,
+      from_chat_id: chatId,
+      message_id: messageId
+    })
+    console.log(JSON.stringify(forwardReq))
+    if (forwardReq.ok) await nfd.put('msg-map-' + forwardReq.result.message_id, chatId)
+    return Boolean(forwardReq.ok)
+  } catch (error) {
+    console.log(`forwardMessage failed: ${error}`)
+    return false
+  }
 }
 
 async function handleNotify (message) {
