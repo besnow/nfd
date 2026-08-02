@@ -7,7 +7,7 @@ function createHarness () {
   const values = new Map()
   const lastWrites = new Map()
   const puts = []
-  const telegram = { forwards: 0, sent: [], deleted: [], copies: [], mapFailures: 0 }
+  const telegram = { forwards: 0, sent: [], deleted: [], copies: [], mapFailures: 0, captchaFailures: 0, claimFailures: 0 }
   const liveMessages = new Set()
   let nextMessageId = 500
   let forwardOk = true
@@ -34,6 +34,8 @@ function createHarness () {
       enforceWriteLimit(key)
       puts.push({ key, value, options, at: Date.now() })
       if (key.startsWith('msg-map-') && telegram.mapFailures-- > 0) throw new Error('KV unavailable')
+      if (key.startsWith('captcha-claim-') && telegram.claimFailures-- > 0) throw new Error('KV unavailable')
+      if (key.startsWith('captcha-') && !key.startsWith('captcha-claim-') && telegram.captchaFailures-- > 0) throw new Error('KV unavailable')
       values.set(key, value)
     },
     async delete (key) {
@@ -167,6 +169,44 @@ async function testDeleteFailureAndClaimRecovery () {
   assert.equal(replacement.expiresAt, stale.expiresAt)
 }
 
+async function testCaptchaWriteFailureDeletesMessage () {
+  const h = createHarness()
+  h.telegram.captchaFailures = 1
+  await h.api.onMessage({ from: { id: 2 }, chat: { id: 2, type: 'private' }, message_id: 10, text: 'question' })
+  const captchaMessage = h.telegram.sent.find(message => message.reply_markup)
+  assert.ok(captchaMessage)
+  assert.equal(h.values.has('captcha-2'), false)
+  assert.equal(h.liveMessages.has(captchaMessage.messageId), false)
+  assert.equal(h.telegram.deleted.at(-1).message_id, captchaMessage.messageId)
+}
+
+async function testCaptchaClaimRetries () {
+  const retry = createHarness()
+  const retryState = installActiveChallenge(retry)
+  retry.values.set('pending-message-2', JSON.stringify({ chatId: 2, messageId: 10, expiresAt: retryState.expiresAt }))
+  retry.telegram.claimFailures = 2
+  await retry.api.onCallbackQuery(callback('2', retryState))
+  const retryPuts = retry.puts.filter(item => item.key === `captcha-claim-${retryState.id}`)
+  assert.equal(retryPuts.length, 3)
+  assert.ok(retryPuts[1].at - retryPuts[0].at >= 1000)
+  assert.ok(retryPuts[2].at - retryPuts[1].at >= 1000)
+  assert.ok(retry.values.has(`captcha-claim-${retryState.id}`))
+  assert.equal(retry.telegram.forwards, 1)
+
+  const exhausted = createHarness()
+  const exhaustedState = installActiveChallenge(exhausted)
+  exhausted.values.set('pending-message-2', JSON.stringify({ chatId: 2, messageId: 10, expiresAt: exhaustedState.expiresAt }))
+  exhausted.telegram.claimFailures = 3
+  await exhausted.api.onCallbackQuery(callback('2', exhaustedState))
+  const exhaustedPuts = exhausted.puts.filter(item => item.key === `captcha-claim-${exhaustedState.id}`)
+  assert.equal(exhaustedPuts.length, 3)
+  assert.ok(exhaustedPuts[1].at - exhaustedPuts[0].at >= 1000)
+  assert.ok(exhaustedPuts[2].at - exhaustedPuts[1].at >= 1000)
+  assert.equal(exhausted.values.has(`captcha-claim-${exhaustedState.id}`), false)
+  assert.equal(exhausted.values.has('verified-2'), true)
+  assert.equal(exhausted.telegram.forwards, 1)
+}
+
 async function testPendingPreservation () {
   const h = createHarness()
   const [first, second] = await Promise.all([
@@ -223,6 +263,8 @@ async function main () {
   await testDelayedDuplicateCorrectAnswer()
   await testConcurrentWrongAnswers()
   await testDeleteFailureAndClaimRecovery()
+  await testCaptchaWriteFailureDeletesMessage()
+  await testCaptchaClaimRetries()
   await testPendingPreservation()
   await testForwardMappingResultsAndAdminReply()
   await testForwardResultMessages()

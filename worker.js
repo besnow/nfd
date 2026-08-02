@@ -247,8 +247,38 @@ async function sendAndStoreCaptcha (key, challenge) {
   }
   challenge.messageId = response.result.message_id
   challenge.writtenAt = Date.now()
-  await nfd.put(key, JSON.stringify(challenge), { expirationTtl: ttl })
+  try {
+    await nfd.put(key, JSON.stringify(challenge), { expirationTtl: ttl })
+  } catch (error) {
+    console.error(`captcha state write failed for UID ${challenge.userId}, message ${challenge.messageId}: ${error}`)
+    try {
+      const deleted = await deleteMessage({ chat_id: challenge.chatId, message_id: challenge.messageId })
+      if (deleted?.ok !== true) {
+        console.error(`captcha cleanup delete failed for UID ${challenge.userId}, message ${challenge.messageId}`)
+      }
+    } catch (deleteError) {
+      console.error(`captcha cleanup delete failed for UID ${challenge.userId}, message ${challenge.messageId}: ${deleteError}`)
+    }
+    return false
+  }
   return true
+}
+
+async function writeCaptchaClaim (state, uid, claimedAt) {
+  const key = 'captcha-claim-' + state.id
+  const value = JSON.stringify({ userId: uid, claimedAt })
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (attempt > 1) await wait(1100)
+    try {
+      await nfd.put(key, value, { expirationTtl: remainingTtl(state.expiresAt) || 60 })
+      return true
+    } catch (error) {
+      if (attempt === 3) {
+        console.error(`captcha claim write failed after 3 attempts for UID ${uid}, challenge ${state.id}: ${error}`)
+      }
+    }
+  }
+  return false
 }
 
 async function ensureCaptcha (message, pending = null) {
@@ -313,10 +343,7 @@ async function onCallbackQuery (query) {
     if (deleted?.ok !== true) return
 
     const claimedAt = Date.now()
-    await nfd.put('captcha-claim-' + state.id, JSON.stringify({
-      userId: uid,
-      claimedAt
-    }), { expirationTtl: remainingTtl(state.expiresAt) || 60 })
+    await writeCaptchaClaim(state, uid, claimedAt)
 
     if (selectedOption.id !== state.correctOptionId) {
       const failures = state.failures + 1
