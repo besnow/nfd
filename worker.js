@@ -14,6 +14,7 @@ const startMsgUrl = 'https://raw.githubusercontent.com/LloydAsp/nfd/main/data/st
 
 const enable_notification = true
 const pendingSaveQueues = new Map()
+const captchaCreationQueues = new Map()
 
 function apiUrl (methodName, params = null) {
   let query = ''
@@ -49,10 +50,6 @@ function answerCallbackQuery (callbackQueryId, text) {
   const body = { callback_query_id: callbackQueryId }
   if (text) body.text = text
   return requestTelegram('answerCallbackQuery', makeReqBody(body))
-}
-
-function editMessageText (msg) {
-  return requestTelegram('editMessageText', makeReqBody(msg))
 }
 
 function deleteMessage (msg) {
@@ -100,8 +97,8 @@ async function onMessage (message) {
 
   const verified = await nfd.get('verified-' + uid, { type: 'json' })
   if (!verified) {
-    if (message.text !== '/start') await savePendingMessage(message)
-    await ensureCaptcha(message)
+    const pending = message.text !== '/start' ? await savePendingMessage(message) : null
+    await ensureCaptcha(message, pending)
     return
   }
 
@@ -148,7 +145,7 @@ function captchaText (challenge) {
   return `为防止广告消息，请完成一个简单验证：\n${challenge.left} ${challenge.operator} ${challenge.right} = ?`
 }
 
-function createCaptcha (userId, chatId, failures = 0, messageId = null, status = 'pending', expiresAt = null) {
+function createCaptcha (userId, chatId, failures = 0, messageId = null, expiresAt = null) {
   const now = Date.now()
   const operator = Math.random() < 0.5 ? '+' : '-'
   let left = Math.floor(Math.random() * 21)
@@ -178,9 +175,10 @@ function createCaptcha (userId, chatId, failures = 0, messageId = null, status =
     options,
     correctOptionId,
     failures,
-    status,
+    status: 'active',
     createdAt: now,
     expiresAt: expiresAt || now + CAPTCHA_TTL_SECONDS * 1000,
+    writtenAt: null,
     chatId,
     messageId
   }
@@ -207,70 +205,79 @@ async function savePendingMessage (message, expiresAt = null) {
   const current = previous.then(async () => {
     const key = 'pending-message-' + uid
     const existing = await nfd.get(key, { type: 'json' })
-    const pending = existing || {
+    if (existing) return existing
+    const pending = {
       chatId: message.chat.id,
-      messageId: message.message_id
+      messageId: message.message_id,
+      expiresAt: expiresAt || Date.now() + CAPTCHA_TTL_SECONDS * 1000
     }
-    if (existing && !expiresAt) return
-    const ttl = expiresAt ? remainingTtl(expiresAt) : CAPTCHA_TTL_SECONDS
+    const ttl = remainingTtl(pending.expiresAt)
     if (ttl > 0) await nfd.put(key, JSON.stringify(pending), { expirationTtl: ttl })
+    return pending
   })
   pendingSaveQueues.set(uid, current)
   try {
-    await current
+    return await current
   } finally {
     if (pendingSaveQueues.get(uid) === current) pendingSaveQueues.delete(uid)
   }
 }
 
-async function refreshPendingMessage (uid, expiresAt) {
-  const key = 'pending-message-' + uid
-  const pending = await nfd.get(key, { type: 'json' })
-  const ttl = remainingTtl(expiresAt)
-  if (pending && ttl > 0) await nfd.put(key, JSON.stringify(pending), { expirationTtl: ttl })
+function wait (milliseconds) {
+  return new Promise(resolve => setTimeout(resolve, milliseconds))
 }
 
-async function ensureCaptcha (message) {
-  const uid = message.from.id.toString()
-  const key = 'captcha-' + uid
-  const existing = await nfd.get(key, { type: 'json' })
-  const now = Date.now()
-  if (existing?.status === 'active' && existing.messageId && existing.expiresAt > now) return
-  if (existing?.status === 'pending' && existing.expiresAt > now && now - existing.createdAt < 10000) return
-  if (existing?.status === 'processing' && existing.expiresAt > now &&
-      now - (existing.processingAt || existing.createdAt) < CAPTCHA_PROCESSING_TIMEOUT_MS) return
-  const failures = existing?.expiresAt > Date.now() ? existing.failures || 0 : 0
+async function waitForCaptchaWrite (state) {
+  const elapsed = Date.now() - (state?.writtenAt || state?.createdAt || 0)
+  if (elapsed < 1100) await wait(1100 - elapsed)
+}
 
-  const challenge = createCaptcha(uid, message.chat.id, failures)
-  await nfd.put(key, JSON.stringify(challenge), { expirationTtl: CAPTCHA_TTL_SECONDS })
-  await refreshPendingMessage(uid, challenge.expiresAt)
-  try {
-    const response = await sendMessage({
-      chat_id: message.chat.id,
-      text: captchaText(challenge),
-      reply_markup: captchaKeyboard(challenge)
-    })
-    if (!response.ok || !response.result?.message_id) {
-      await deleteCaptchaIfCurrent(key, challenge.id)
-      return
-    }
-    const current = await nfd.get(key, { type: 'json' })
-    if (current?.id !== challenge.id) {
-      await deleteMessage({ chat_id: message.chat.id, message_id: response.result.message_id })
-      return
-    }
-    challenge.status = 'active'
-    challenge.messageId = response.result.message_id
-    await nfd.put(key, JSON.stringify(challenge), { expirationTtl: CAPTCHA_TTL_SECONDS })
-  } catch (error) {
-    await deleteCaptchaIfCurrent(key, challenge.id)
-    throw error
+async function sendAndStoreCaptcha (key, challenge) {
+  if (remainingTtl(challenge.expiresAt) <= 0) return false
+  const response = await sendMessage({
+    chat_id: challenge.chatId,
+    text: captchaText(challenge),
+    reply_markup: captchaKeyboard(challenge)
+  })
+  if (response?.ok !== true || !response.result?.message_id) return false
+  const ttl = remainingTtl(challenge.expiresAt)
+  if (ttl <= 0) {
+    await deleteMessage({ chat_id: challenge.chatId, message_id: response.result.message_id })
+    return false
   }
+  challenge.messageId = response.result.message_id
+  challenge.writtenAt = Date.now()
+  await nfd.put(key, JSON.stringify(challenge), { expirationTtl: ttl })
+  return true
 }
 
-async function deleteCaptchaIfCurrent (key, challengeId) {
-  const current = await nfd.get(key, { type: 'json' })
-  if (current?.id === challengeId) await nfd.delete(key)
+async function ensureCaptcha (message, pending = null) {
+  const uid = message.from.id.toString()
+  const previous = captchaCreationQueues.get(uid) || Promise.resolve()
+  const current = previous.then(async () => {
+    const key = 'captcha-' + uid
+    const existing = await nfd.get(key, { type: 'json' })
+    const now = Date.now()
+    if (existing?.status === 'active' && existing.messageId && existing.expiresAt > now) {
+      const claim = await nfd.get('captcha-claim-' + existing.id, { type: 'json' })
+      if (!claim || now - claim.claimedAt <= CAPTCHA_PROCESSING_TIMEOUT_MS) return
+      if (await nfd.get('verified-' + uid, { type: 'json' })) return
+      await waitForCaptchaWrite(existing)
+    }
+
+    const expiresAt = existing?.expiresAt > now
+      ? existing.expiresAt
+      : pending?.expiresAt > now ? pending.expiresAt : now + CAPTCHA_TTL_SECONDS * 1000
+    const failures = existing?.expiresAt > now ? existing.failures || 0 : 0
+    const challenge = createCaptcha(uid, message.chat.id, failures, null, expiresAt)
+    await sendAndStoreCaptcha(key, challenge)
+  })
+  captchaCreationQueues.set(uid, current)
+  try {
+    await current
+  } finally {
+    if (captchaCreationQueues.get(uid) === current) captchaCreationQueues.delete(uid)
+  }
 }
 
 async function onCallbackQuery (query) {
@@ -293,65 +300,38 @@ async function onCallbackQuery (query) {
     const selectedOption = state.options.find(option => option.id === parts[2])
     if (!selectedOption) return
 
+    let deleted
+    try {
+      deleted = await deleteMessage({
+        chat_id: state.chatId,
+        message_id: state.messageId
+      })
+    } catch (error) {
+      console.error(`captcha claim delete failed: ${error}`)
+      return
+    }
+    if (deleted?.ok !== true) return
+
+    const claimedAt = Date.now()
+    await nfd.put('captcha-claim-' + state.id, JSON.stringify({
+      userId: uid,
+      claimedAt
+    }), { expirationTtl: remainingTtl(state.expiresAt) || 60 })
+
     if (selectedOption.id !== state.correctOptionId) {
       const failures = state.failures + 1
       if (failures >= 3) {
         await nfd.put('captcha-block-' + uid, 'true', { expirationTtl: CAPTCHA_BLOCK_SECONDS })
-        await deleteCaptchaIfCurrent(stateKey, state.id)
         return
       }
 
       const ttl = remainingTtl(state.expiresAt)
-      if (ttl <= 0) {
-        await deleteCaptchaIfCurrent(stateKey, state.id)
-        return
-      }
-
-      // Saving a new challenge first makes every button from the previous challenge stale,
-      // while retaining the original verification session deadline.
-      const replacement = createCaptcha(uid, state.chatId, failures, state.messageId, 'active', state.expiresAt)
-      await nfd.put(stateKey, JSON.stringify(replacement), { expirationTtl: ttl })
-      await refreshPendingMessage(uid, state.expiresAt)
-      try {
-        const response = await editMessageText({
-          chat_id: state.chatId,
-          message_id: state.messageId,
-          text: captchaText(replacement),
-          reply_markup: captchaKeyboard(replacement)
-        })
-        if (!response.ok) {
-          await deleteCaptchaIfCurrent(stateKey, replacement.id)
-        }
-      } catch (error) {
-        await deleteCaptchaIfCurrent(stateKey, replacement.id)
-        throw error
-      }
+      if (ttl <= 0) return
+      await waitForCaptchaWrite(state)
+      const replacement = createCaptcha(uid, state.chatId, failures, null, state.expiresAt)
+      await sendAndStoreCaptcha(stateKey, replacement)
       return
     }
-
-    // KV is not used as a lock. Telegram accepting this edit elects the only callback
-    // that may continue; concurrent identical edits fail with "message is not modified".
-    state.status = 'processing'
-    state.processingAt = Date.now()
-    const processingTtl = remainingTtl(state.expiresAt)
-    if (processingTtl <= 0) {
-      await deleteCaptchaIfCurrent(stateKey, state.id)
-      return
-    }
-    await nfd.put(stateKey, JSON.stringify(state), { expirationTtl: processingTtl })
-    let claimed
-    try {
-      claimed = await editMessageText({
-        chat_id: query.message.chat.id,
-        message_id: query.message.message_id,
-        text: '⏳ 验证处理中，请稍候……',
-        reply_markup: { inline_keyboard: [] }
-      })
-    } catch (error) {
-      console.error(`captcha claim edit failed: ${error}`)
-      return
-    }
-    if (claimed?.ok !== true) return
 
     await nfd.put('verified-' + uid, 'true')
 
@@ -365,8 +345,6 @@ async function onCallbackQuery (query) {
       } else {
         resultText = '✅ 验证成功，但原消息发送失败，请重新发送一次。'
       }
-      await nfd.delete(pendingKey)
-      await deleteCaptchaIfCurrent(stateKey, state.id)
       if (forwardResult.forwarded) {
         try {
           await handleNotify({ chat: { id: pending.chatId } })
@@ -374,15 +352,8 @@ async function onCallbackQuery (query) {
           console.log(`handleNotify failed: ${error}`)
         }
       }
-    } else {
-      await deleteCaptchaIfCurrent(stateKey, state.id)
     }
-    await editMessageText({
-      chat_id: query.message.chat.id,
-      message_id: query.message.message_id,
-      text: resultText,
-      reply_markup: { inline_keyboard: [] }
-    })
+    await sendMessage({ chat_id: state.chatId, text: resultText })
   } finally {
     // Telegram requires every callback to be acknowledged, including ignored stale callbacks.
     await answerCallbackQuery(query.id)
@@ -453,6 +424,7 @@ async function forwardGuestMessage (chatId, messageId) {
   }
 
   for (let attempt = 1; attempt <= 3; attempt++) {
+    if (attempt > 1) await wait(1100)
     try {
       await nfd.put('msg-map-' + adminMessageId, chatId.toString())
       return { forwarded: true, mapped: true, adminMessageId }
