@@ -3,7 +3,6 @@ const WEBHOOK = '/endpoint'
 const SECRET = ENV_BOT_SECRET // A-Z, a-z, 0-9, _ and -
 const ADMIN_UID = ENV_ADMIN_UID.toString() // your user id, get it from https://t.me/username_to_id_bot
 
-const NOTIFY_INTERVAL = 3600 * 1000
 const CAPTCHA_TTL_SECONDS = 10 * 60
 const CAPTCHA_PROCESSING_TIMEOUT_MS = 30 * 1000
 const CAPTCHA_BLOCK_SECONDS = 60 * 60
@@ -15,10 +14,8 @@ const RISK_THRESHOLD = 3
 const SPAM_FINGERPRINT_TTL_SECONDS = 30 * 24 * 60 * 60
 const RATE_BLOCK_SECONDS = 24 * 60 * 60
 const fraudDb = 'https://raw.githubusercontent.com/LloydAsp/nfd/main/data/fraud.db'
-const notificationUrl = 'https://raw.githubusercontent.com/LloydAsp/nfd/main/data/notification.txt'
-const startMsgUrl = 'https://raw.githubusercontent.com/LloydAsp/nfd/main/data/startMessage.md'
+const startMsgUrl = 'https://raw.githubusercontent.com/besnow/nfd/main/data/startMessage.md'
 
-const enable_notification = true
 const pendingSaveQueues = new Map()
 const captchaCreationQueues = new Map()
 
@@ -624,13 +621,6 @@ async function handleNotify (message) {
   const chatId = message.chat.id
   if (await isFraud(chatId)) {
     return sendMessage({ chat_id: ADMIN_UID, text: `检测到骗子，UID${chatId}` })
-  }
-  if (enable_notification) {
-    const lastMsgTime = await nfd.get('lastmsg-' + chatId, { type: 'json' })
-    if (!lastMsgTime || Date.now() - lastMsgTime > NOTIFY_INTERVAL) {
-      await nfd.put('lastmsg-' + chatId, Date.now())
-      return sendMessage({ chat_id: ADMIN_UID, text: await fetch(notificationUrl).then(r => r.text()) })
-    }
   }
 }
 
