@@ -181,6 +181,21 @@ async function testSilentRiskFlow () {
     [3, 3]
   )
 
+  const forwardedMediaAd = createHarness()
+  await forwardedMediaAd.api.onMessage({
+    from: { id: 6 },
+    chat: { id: 6, type: 'private' },
+    message_id: 12,
+    photo: [{ file_id: 'photo' }],
+    forward_origin: { type: 'user' },
+    via_bot: { id: 99, is_bot: true, username: 'PostBot' },
+    reply_markup: {
+      inline_keyboard: [[{ text: '官方频道', url: 'https://t.me/example' }]]
+    }
+  })
+  assert.equal(forwardedMediaAd.telegram.forwards, 0)
+  assert.ok(forwardedMediaAd.values.has('captcha-6'))
+
   const oldVerification = createHarness()
   oldVerification.values.set('verified-3', 'true')
   await oldVerification.api.onMessage(suspiciousMessage(3, 11))
@@ -456,6 +471,11 @@ async function testRiskScoring () {
   assert.ok(h.api.getMessageRiskScore({ text: '请查看 https://example.com' }) >= 3)
   assert.ok(h.api.getMessageRiskScore({ text: '投资合作请联系我 @example_user' }) >= 3)
   assert.ok(h.api.getMessageRiskScore({ photo: [{}], caption: '问题截图' }) < 3)
+  assert.ok(h.api.getMessageRiskScore({ photo: [{}], forward_origin: { type: 'user' } }) >= 3)
+  assert.ok(h.api.getMessageRiskScore({ photo: [{}], via_bot: { is_bot: true } }) >= 3)
+  assert.ok(h.api.getMessageRiskScore({
+    reply_markup: { inline_keyboard: [[{ text: '打开', url: 'https://example.com' }]] }
+  }) >= 3)
 }
 
 async function main () {
