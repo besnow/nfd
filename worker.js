@@ -206,6 +206,14 @@ function getMessageEntities (message) {
   ]
 }
 
+function hasExternalInlineButton (message) {
+  const rows = message.reply_markup?.inline_keyboard
+  if (!Array.isArray(rows)) return false
+  return rows.some(row => Array.isArray(row) && row.some(button =>
+    typeof button?.url === 'string' || button?.login_url || button?.web_app
+  ))
+}
+
 function getMessageRiskScore (message) {
   const text = getMessageText(message).normalize('NFKC').toLowerCase()
   const entityTypes = new Set(getMessageEntities(message).map(entity => entity.type))
@@ -224,8 +232,14 @@ function getMessageRiskScore (message) {
   if (matchedTerms >= 2) score += 3
   else if (matchedTerms === 1) score += 1
 
-  if (message.photo || message.video || message.animation || message.document) score += 1
-  if (message.forward_origin || message.forward_from || message.forward_from_chat) score += 1
+  const hasMedia = Boolean(message.photo || message.video || message.animation || message.document)
+  const isForwarded = Boolean(message.forward_origin || message.forward_from || message.forward_from_chat)
+  if (hasMedia) score += 1
+  // Forwarded media is a common ad container. Plain forwarded text stays low
+  // risk, while forwarded images/videos reach the challenge threshold.
+  if (isForwarded) score += hasMedia ? 2 : 1
+  if (message.via_bot) score += 2
+  if (hasExternalInlineButton(message)) score += 3
   if ((text.match(/\n/g) || []).length >= 4 || /(.)\1{7,}/u.test(text)) score += 1
 
   return score
