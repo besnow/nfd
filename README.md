@@ -36,6 +36,7 @@ No Fraud / Node Forward Bot
     - 增加一个`ENV_ADMIN_UID`变量，数值为从步骤3中获得的用户id
 6. 绑定kv数据库，创建一个Namespace Name为`nfd`的kv数据库，在setting -> variable中设置`KV Namespace Bindings`：nfd -> nfd
 7. 点击`Quick Edit`，复制[这个文件](./worker.js)到编辑器中
+   - `/start` 返回的使用说明保存在 [`data/startMessage.md`](./data/startMessage.md)，可以按需要修改
 8. 部署后使用下面的命令注册 Webhook。管理接口只接受 `POST`，并要求与
    `ENV_BOT_SECRET` 完全一致的 Bearer Token（不要把真实密钥提交到仓库或 shell 历史）：
 
@@ -110,7 +111,6 @@ No Fraud / Node Forward Bot
 | `isblocked-{UID}` | 管理员通过 `/block` 设置的永久屏蔽状态 |
 | `spam-fingerprint-{SHA256}` | 管理员确认的规范化广告文本指纹及来源 UID，保存 30 天 |
 | `msg-map-{消息ID}` | 转发给管理员的消息 ID 到访客 chat ID 的映射；管理员回复依赖此键 |
-| `lastmsg-{UID}` | 上一次向管理员发送安全提醒的时间 |
 
 ## 欺诈数据源
 - 文件[fraud.db](./fraud.db)为欺诈数据，格式为每行一个uid
