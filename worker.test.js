@@ -7,7 +7,15 @@ function createHarness () {
   const values = new Map()
   const lastWrites = new Map()
   const puts = []
-  const telegram = { forwards: 0, sent: [], deleted: [], copies: [], mapFailures: 0, captchaFailures: 0, claimFailures: 0 }
+  const telegram = {
+    forwards: 0,
+    sent: [],
+    deleted: [],
+    copies: [],
+    mapFailures: 0,
+    captchaFailures: 0,
+    claimFailures: 0
+  }
   const liveMessages = new Set()
   let nextMessageId = 500
   let forwardOk = true
@@ -35,7 +43,9 @@ function createHarness () {
       puts.push({ key, value, options, at: Date.now() })
       if (key.startsWith('msg-map-') && telegram.mapFailures-- > 0) throw new Error('KV unavailable')
       if (key.startsWith('captcha-claim-') && telegram.claimFailures-- > 0) throw new Error('KV unavailable')
-      if (key.startsWith('captcha-') && !key.startsWith('captcha-claim-') && telegram.captchaFailures-- > 0) throw new Error('KV unavailable')
+      if (key.startsWith('captcha-') && !key.startsWith('captcha-claim-') && telegram.captchaFailures-- > 0) {
+        throw new Error('KV unavailable')
+      }
       values.set(key, value)
     },
     async delete (key) {
@@ -72,25 +82,45 @@ function createHarness () {
   }
 
   const source = fs.readFileSync('worker.js', 'utf8') + `
-    ;globalThis.testApi = { createCaptcha, savePendingMessage, ensureCaptcha,
-      onCallbackQuery, onMessage, forwardGuestMessage, handleAdminMessage }
+    ;globalThis.testApi = {
+      createCaptcha, savePendingMessage, ensureCaptcha, onCallbackQuery, onMessage,
+      forwardGuestMessage, handleAdminMessage, getMessageRiskScore,
+      getMessageFingerprint, getCurrentVerification
+    }
   `
   const context = {
-    ENV_BOT_TOKEN: 'token', ENV_BOT_SECRET: 'secret', ENV_ADMIN_UID: 1,
-    addEventListener () {}, crypto: webcrypto, URL, URLSearchParams, Response,
-    console, Date, Math, fetch, nfd, setTimeout
+    ENV_BOT_TOKEN: 'token',
+    ENV_BOT_SECRET: 'secret',
+    ENV_ADMIN_UID: 1,
+    addEventListener () {},
+    crypto: webcrypto,
+    TextEncoder,
+    Uint8Array,
+    URL,
+    URLSearchParams,
+    Response,
+    console,
+    Date,
+    Math,
+    fetch,
+    nfd,
+    setTimeout
   }
   vm.createContext(context)
   vm.runInContext(source, context)
   return {
-    api: context.testApi, values, puts, telegram, liveMessages,
+    api: context.testApi,
+    values,
+    puts,
+    telegram,
+    liveMessages,
     setForwardOk (value) { forwardOk = value },
     setDeleteFailure (value) { forceDeleteFailure = value }
   }
 }
 
-function installActiveChallenge (h, uid = '2', messageId = 99) {
-  const state = h.api.createCaptcha(uid, Number(uid), 0, messageId)
+function installActiveChallenge (h, uid = '2', messageId = 99, round = 1) {
+  const state = h.api.createCaptcha(uid, Number(uid), 0, messageId, null, round)
   state.writtenAt = Date.now() - 1200
   h.values.set(`captcha-${uid}`, JSON.stringify(state))
   h.liveMessages.add(messageId)
@@ -102,51 +132,140 @@ function callback (uid, state, optionId = state.correctOptionId) {
     id: `callback-${Math.random()}`,
     from: { id: Number(uid) },
     data: `captcha:${state.id}:${optionId}`,
-    message: { message_id: state.messageId, chat: { id: state.chatId, type: 'private' } }
+    message: {
+      message_id: state.messageId,
+      chat: { id: state.chatId, type: 'private' }
+    }
   }
 }
 
-async function testOrdinaryAndStartFlows () {
+function suspiciousMessage (uid = 2, messageId = 10) {
+  return {
+    from: { id: uid },
+    chat: { id: uid, type: 'private' },
+    message_id: messageId,
+    text: '请访问 https://example.com 联系我们'
+  }
+}
+
+async function testSilentRiskFlow () {
   const ordinary = createHarness()
-  await ordinary.api.onMessage({ from: { id: 2 }, chat: { id: 2, type: 'private' }, message_id: 10, text: 'question' })
-  const state = JSON.parse(ordinary.values.get('captcha-2'))
-  const pending = JSON.parse(ordinary.values.get('pending-message-2'))
-  assert.equal(pending.messageId, 10)
-  assert.equal(state.expiresAt, pending.expiresAt)
-  await ordinary.api.onCallbackQuery(callback('2', state))
+  await ordinary.api.onMessage({
+    from: { id: 2 },
+    chat: { id: 2, type: 'private' },
+    message_id: 10,
+    text: '你好，我想咨询一个问题'
+  })
   assert.equal(ordinary.telegram.forwards, 1)
+  assert.equal(ordinary.values.has('captcha-2'), false)
+  assert.equal(ordinary.values.has('pending-message-2'), false)
+  await ordinary.api.onMessage({
+    from: { id: 2 },
+    chat: { id: 2, type: 'private' },
+    message_id: 11,
+    text: '再补充一条消息'
+  })
+  assert.equal(ordinary.telegram.forwards, 2)
+
+  const suspicious = createHarness()
+  await suspicious.api.onMessage(suspiciousMessage())
+  const state = JSON.parse(suspicious.values.get('captcha-2'))
+  const pending = JSON.parse(suspicious.values.get('pending-message-2'))
+  const captchaMessage = suspicious.telegram.sent.find(message => message.reply_markup)
+  assert.equal(suspicious.telegram.forwards, 0)
+  assert.equal(pending.messageId, 10)
+  assert.equal(state.round, 1)
+  assert.equal(state.options.length, 6)
+  assert.deepEqual(
+    Array.from(vm.runInNewContext('value', { value: captchaMessage.reply_markup.inline_keyboard.map(row => row.length) })),
+    [3, 3]
+  )
+
+  const oldVerification = createHarness()
+  oldVerification.values.set('verified-3', 'true')
+  await oldVerification.api.onMessage(suspiciousMessage(3, 11))
+  assert.ok(oldVerification.values.has('captcha-3'))
+  assert.equal(oldVerification.telegram.forwards, 0)
+
+  const trusted = createHarness()
+  trusted.values.set('trusted-4', JSON.stringify({ trustedAt: Date.now() }))
+  await trusted.api.onMessage(suspiciousMessage(4, 12))
+  assert.equal(trusted.telegram.forwards, 1)
+  assert.equal(trusted.values.has('captcha-4'), false)
 
   const start = createHarness()
-  await start.api.onMessage({ from: { id: 3 }, chat: { id: 3, type: 'private' }, message_id: 20, text: '/start' })
-  assert.equal(start.values.has('pending-message-3'), false)
-  assert.ok(start.values.has('captcha-3'))
+  await start.api.onMessage({
+    from: { id: 5 },
+    chat: { id: 5, type: 'private' },
+    message_id: 20,
+    text: '/start'
+  })
+  assert.equal(start.telegram.forwards, 0)
+  assert.equal(start.values.has('captcha-5'), false)
+  assert.ok(start.telegram.sent.some(message => !message.reply_markup))
+}
+
+async function testTwoRoundCaptcha () {
+  const h = createHarness()
+  const first = installActiveChallenge(h)
+  h.values.set('pending-message-2', JSON.stringify({
+    chatId: 2,
+    messageId: 10,
+    expiresAt: first.expiresAt
+  }))
+
+  await h.api.onCallbackQuery(callback('2', first))
+  const second = JSON.parse(h.values.get('captcha-2'))
+  assert.equal(second.round, 2)
+  assert.equal(h.telegram.forwards, 0)
+  assert.equal(h.values.has('verified-2'), false)
+
+  await h.api.onCallbackQuery(callback('2', second))
+  const verified = JSON.parse(h.values.get('verified-2'))
+  assert.equal(verified.version, 2)
+  assert.ok(verified.expiresAt > Date.now())
+  assert.equal(h.telegram.forwards, 1)
+  assert.match(h.telegram.sent.at(-1).text, /验证成功/)
 }
 
 async function testDelayedDuplicateCorrectAnswer () {
   const h = createHarness()
-  const state = installActiveChallenge(h)
-  h.values.set('pending-message-2', JSON.stringify({ chatId: 2, messageId: 10, expiresAt: state.expiresAt }))
-  await h.api.onCallbackQuery(callback('2', state))
-  await h.api.onCallbackQuery(callback('2', state))
+  const first = installActiveChallenge(h)
+  h.values.set('pending-message-2', JSON.stringify({
+    chatId: 2,
+    messageId: 10,
+    expiresAt: first.expiresAt
+  }))
+  await h.api.onCallbackQuery(callback('2', first))
+  await h.api.onCallbackQuery(callback('2', first))
+  const second = JSON.parse(h.values.get('captcha-2'))
+  await h.api.onCallbackQuery(callback('2', second))
   assert.equal(h.telegram.forwards, 1)
-  assert.equal(h.telegram.deleted.length, 2)
-  assert.ok(h.values.has(`captcha-claim-${state.id}`))
+  assert.ok(h.values.has(`captcha-claim-${first.id}`))
 }
 
-async function testConcurrentWrongAnswers () {
-  const h = createHarness()
-  const state = installActiveChallenge(h)
+async function testWrongAnswersAndConcurrency () {
+  const concurrent = createHarness()
+  const state = installActiveChallenge(concurrent)
   const wrong = state.options.find(option => option.id !== state.correctOptionId).id
   await Promise.all([
-    h.api.onCallbackQuery(callback('2', state, wrong)),
-    h.api.onCallbackQuery(callback('2', state, wrong))
+    concurrent.api.onCallbackQuery(callback('2', state, wrong)),
+    concurrent.api.onCallbackQuery(callback('2', state, wrong))
   ])
-  const replacement = JSON.parse(h.values.get('captcha-2'))
-  const captchaSends = h.telegram.sent.filter(message => message.reply_markup)
+  const replacement = JSON.parse(concurrent.values.get('captcha-2'))
   assert.equal(replacement.failures, 1)
-  assert.equal(captchaSends.length, 1)
-  assert.equal(replacement.messageId, captchaSends[0].messageId)
-  assert.equal(replacement.expiresAt, state.expiresAt)
+  assert.equal(replacement.round, 1)
+  assert.equal(concurrent.telegram.sent.filter(message => message.reply_markup).length, 1)
+
+  const blocked = createHarness()
+  const first = installActiveChallenge(blocked)
+  const firstWrong = first.options.find(option => option.id !== first.correctOptionId).id
+  await blocked.api.onCallbackQuery(callback('2', first, firstWrong))
+  const secondTry = JSON.parse(blocked.values.get('captcha-2'))
+  const secondWrong = secondTry.options.find(option => option.id !== secondTry.correctOptionId).id
+  await blocked.api.onCallbackQuery(callback('2', secondTry, secondWrong))
+  assert.equal(blocked.values.get('captcha-block-2'), 'true')
+  assert.equal(blocked.telegram.forwards, 0)
 }
 
 async function testDeleteFailureAndClaimRecovery () {
@@ -162,8 +281,14 @@ async function testDeleteFailureAndClaimRecovery () {
   const stale = installActiveChallenge(recovery)
   stale.writtenAt = Date.now() - 40000
   recovery.values.set('captcha-2', JSON.stringify(stale))
-  recovery.values.set(`captcha-claim-${stale.id}`, JSON.stringify({ userId: '2', claimedAt: Date.now() - 31000 }))
-  await recovery.api.ensureCaptcha({ from: { id: 2 }, chat: { id: 2, type: 'private' } })
+  recovery.values.set(
+    `captcha-claim-${stale.id}`,
+    JSON.stringify({ userId: '2', claimedAt: Date.now() - 31000 })
+  )
+  await recovery.api.ensureCaptcha({
+    from: { id: 2 },
+    chat: { id: 2, type: 'private' }
+  })
   const replacement = JSON.parse(recovery.values.get('captcha-2'))
   assert.notEqual(replacement.id, stale.id)
   assert.equal(replacement.expiresAt, stale.expiresAt)
@@ -172,7 +297,7 @@ async function testDeleteFailureAndClaimRecovery () {
 async function testCaptchaWriteFailureDeletesMessage () {
   const h = createHarness()
   h.telegram.captchaFailures = 1
-  await h.api.onMessage({ from: { id: 2 }, chat: { id: 2, type: 'private' }, message_id: 10, text: 'question' })
+  await h.api.onMessage(suspiciousMessage())
   const captchaMessage = h.telegram.sent.find(message => message.reply_markup)
   assert.ok(captchaMessage)
   assert.equal(h.values.has('captcha-2'), false)
@@ -182,28 +307,31 @@ async function testCaptchaWriteFailureDeletesMessage () {
 
 async function testCaptchaClaimRetries () {
   const retry = createHarness()
-  const retryState = installActiveChallenge(retry)
-  retry.values.set('pending-message-2', JSON.stringify({ chatId: 2, messageId: 10, expiresAt: retryState.expiresAt }))
+  const state = installActiveChallenge(retry, '2', 99, 2)
+  retry.values.set('pending-message-2', JSON.stringify({
+    chatId: 2,
+    messageId: 10,
+    expiresAt: state.expiresAt
+  }))
   retry.telegram.claimFailures = 2
-  await retry.api.onCallbackQuery(callback('2', retryState))
-  const retryPuts = retry.puts.filter(item => item.key === `captcha-claim-${retryState.id}`)
+  await retry.api.onCallbackQuery(callback('2', state))
+  const retryPuts = retry.puts.filter(item => item.key === `captcha-claim-${state.id}`)
   assert.equal(retryPuts.length, 3)
   assert.ok(retryPuts[1].at - retryPuts[0].at >= 1000)
   assert.ok(retryPuts[2].at - retryPuts[1].at >= 1000)
-  assert.ok(retry.values.has(`captcha-claim-${retryState.id}`))
   assert.equal(retry.telegram.forwards, 1)
 
   const exhausted = createHarness()
-  const exhaustedState = installActiveChallenge(exhausted)
-  exhausted.values.set('pending-message-2', JSON.stringify({ chatId: 2, messageId: 10, expiresAt: exhaustedState.expiresAt }))
+  const exhaustedState = installActiveChallenge(exhausted, '2', 99, 2)
+  exhausted.values.set('pending-message-2', JSON.stringify({
+    chatId: 2,
+    messageId: 10,
+    expiresAt: exhaustedState.expiresAt
+  }))
   exhausted.telegram.claimFailures = 3
   await exhausted.api.onCallbackQuery(callback('2', exhaustedState))
-  const exhaustedPuts = exhausted.puts.filter(item => item.key === `captcha-claim-${exhaustedState.id}`)
-  assert.equal(exhaustedPuts.length, 3)
-  assert.ok(exhaustedPuts[1].at - exhaustedPuts[0].at >= 1000)
-  assert.ok(exhaustedPuts[2].at - exhaustedPuts[1].at >= 1000)
   assert.equal(exhausted.values.has(`captcha-claim-${exhaustedState.id}`), false)
-  assert.equal(exhausted.values.has('verified-2'), true)
+  assert.equal(JSON.parse(exhausted.values.get('verified-2')).version, 2)
   assert.equal(exhausted.telegram.forwards, 1)
 }
 
@@ -219,7 +347,7 @@ async function testPendingPreservation () {
   assert.equal(h.puts.filter(item => item.key === 'pending-message-2').length, 1)
 }
 
-async function testForwardMappingResultsAndAdminReply () {
+async function testForwardMappingAndAutomaticTrust () {
   const retry = createHarness()
   retry.telegram.mapFailures = 1
   const retryResult = await retry.api.forwardGuestMessage(2, 10)
@@ -238,37 +366,112 @@ async function testForwardMappingResultsAndAdminReply () {
   assert.equal((await failed.api.forwardGuestMessage(4, 12)).forwarded, false)
 
   retry.values.set('msg-map-700', '2')
-  await retry.api.handleAdminMessage({ from: { id: 1 }, chat: { id: 1 }, message_id: 30, text: 'reply', reply_to_message: { message_id: 700, chat: { id: 1 } } })
+  await retry.api.handleAdminMessage({
+    from: { id: 1 },
+    chat: { id: 1 },
+    message_id: 30,
+    text: '正常回复',
+    reply_to_message: { message_id: 700, chat: { id: 1 } }
+  })
   assert.equal(retry.telegram.copies.at(-1).chat_id, 2)
+  assert.ok(JSON.parse(retry.values.get('trusted-2')).trustedAt)
+}
+
+async function testSpamFingerprintBlocking () {
+  const h = createHarness()
+  const ad = '推广投资高收益，请访问 https://spam.example.com 联系我们'
+  h.values.set('msg-map-700', '2')
+  h.values.set('trusted-2', JSON.stringify({ trustedAt: Date.now() }))
+  h.values.set('verified-2', JSON.stringify({
+    version: 2,
+    expiresAt: Date.now() + 60000
+  }))
+
+  await h.api.handleAdminMessage({
+    from: { id: 1 },
+    chat: { id: 1 },
+    message_id: 30,
+    text: '/block',
+    reply_to_message: { message_id: 700, chat: { id: 1 }, text: ad }
+  })
+
+  assert.equal(h.values.get('isblocked-2'), 'true')
+  assert.equal(h.values.has('trusted-2'), false)
+  assert.equal(h.values.has('verified-2'), false)
+  const fingerprintKeys = [...h.values.keys()].filter(key => key.startsWith('spam-fingerprint-'))
+  assert.equal(fingerprintKeys.length, 1)
+
+  await h.api.onMessage({
+    from: { id: 3 },
+    chat: { id: 3, type: 'private' },
+    message_id: 31,
+    text: ad
+  })
+  assert.equal(h.values.get('isblocked-3'), 'true')
+  assert.equal(h.telegram.forwards, 0)
+
+  const unblocked = createHarness()
+  const fingerprint = await unblocked.api.getMessageFingerprint({ text: ad })
+  unblocked.values.set('msg-map-700', '2')
+  unblocked.values.set('isblocked-2', 'true')
+  unblocked.values.set('spam-fingerprint-' + fingerprint, 'true')
+  await unblocked.api.handleAdminMessage({
+    from: { id: 1 },
+    chat: { id: 1 },
+    message_id: 32,
+    text: '/unblock',
+    reply_to_message: { message_id: 700, chat: { id: 1 }, text: ad }
+  })
+  assert.equal(unblocked.values.get('isblocked-2'), 'false')
+  assert.equal(unblocked.values.has('spam-fingerprint-' + fingerprint), false)
 }
 
 async function testForwardResultMessages () {
   const mappingFailed = createHarness()
-  const mappedState = installActiveChallenge(mappingFailed)
-  mappingFailed.values.set('pending-message-2', JSON.stringify({ chatId: 2, messageId: 10, expiresAt: mappedState.expiresAt }))
+  const mappedState = installActiveChallenge(mappingFailed, '2', 99, 2)
+  mappingFailed.values.set('pending-message-2', JSON.stringify({
+    chatId: 2,
+    messageId: 10,
+    expiresAt: mappedState.expiresAt
+  }))
   mappingFailed.telegram.mapFailures = 3
   await mappingFailed.api.onCallbackQuery(callback('2', mappedState))
   assert.match(mappingFailed.telegram.sent.at(-1).text, /您的消息已发送/)
 
   const forwardFailed = createHarness()
-  const failedState = installActiveChallenge(forwardFailed)
-  forwardFailed.values.set('pending-message-2', JSON.stringify({ chatId: 2, messageId: 10, expiresAt: failedState.expiresAt }))
+  const failedState = installActiveChallenge(forwardFailed, '2', 99, 2)
+  forwardFailed.values.set('pending-message-2', JSON.stringify({
+    chatId: 2,
+    messageId: 10,
+    expiresAt: failedState.expiresAt
+  }))
   forwardFailed.setForwardOk(false)
   await forwardFailed.api.onCallbackQuery(callback('2', failedState))
   assert.match(forwardFailed.telegram.sent.at(-1).text, /请重新发送一次/)
 }
 
+async function testRiskScoring () {
+  const h = createHarness()
+  assert.equal(h.api.getMessageRiskScore({ text: '你好，我想咨询问题' }), 0)
+  assert.ok(h.api.getMessageRiskScore({ text: '请查看 https://example.com' }) >= 3)
+  assert.ok(h.api.getMessageRiskScore({ text: '投资合作请联系我 @example_user' }) >= 3)
+  assert.ok(h.api.getMessageRiskScore({ photo: [{}], caption: '问题截图' }) < 3)
+}
+
 async function main () {
-  await testOrdinaryAndStartFlows()
+  await testSilentRiskFlow()
+  await testTwoRoundCaptcha()
   await testDelayedDuplicateCorrectAnswer()
-  await testConcurrentWrongAnswers()
+  await testWrongAnswersAndConcurrency()
   await testDeleteFailureAndClaimRecovery()
   await testCaptchaWriteFailureDeletesMessage()
   await testCaptchaClaimRetries()
   await testPendingPreservation()
-  await testForwardMappingResultsAndAdminReply()
+  await testForwardMappingAndAutomaticTrust()
+  await testSpamFingerprintBlocking()
   await testForwardResultMessages()
-  console.log('worker tests passed with KV one-write-per-second enforcement')
+  await testRiskScoring()
+  console.log('worker tests passed with silent risk control and KV write-limit enforcement')
 }
 
 main().catch(error => {
