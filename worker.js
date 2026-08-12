@@ -15,6 +15,7 @@ const SPAM_FINGERPRINT_TTL_SECONDS = 30 * 24 * 60 * 60
 const RATE_BLOCK_SECONDS = 24 * 60 * 60
 const fraudDb = 'https://raw.githubusercontent.com/LloydAsp/nfd/main/data/fraud.db'
 const startMsgUrl = 'https://raw.githubusercontent.com/besnow/nfd/main/data/startMessage.md'
+const adminMsgUrl = 'https://raw.githubusercontent.com/besnow/nfd/main/data/adminMessage.md'
 
 const pendingSaveQueues = new Map()
 const captchaCreationQueues = new Map()
@@ -165,7 +166,7 @@ async function onMessage (message) {
 
 async function handleAdminMessage (message) {
   if (message.text === '/start') {
-    const startMsg = await fetch(startMsgUrl).then(r => r.text())
+    const startMsg = await fetch(adminMsgUrl).then(r => r.text())
     return sendMessage({ chat_id: message.chat.id, text: startMsg })
   }
   if (!message?.reply_to_message?.chat) {

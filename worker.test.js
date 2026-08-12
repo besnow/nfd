@@ -4,6 +4,8 @@ const vm = require('node:vm')
 const { webcrypto } = require('node:crypto')
 
 function createHarness () {
+  const visitorStartMessage = fs.readFileSync('data/startMessage.md', 'utf8')
+  const adminStartMessage = fs.readFileSync('data/adminMessage.md', 'utf8')
   const values = new Map()
   const lastWrites = new Map()
   const puts = []
@@ -55,6 +57,8 @@ function createHarness () {
   }
 
   async function fetch (url, request = {}) {
+    if (url.endsWith('/data/startMessage.md')) return { text: async () => visitorStartMessage }
+    if (url.endsWith('/data/adminMessage.md')) return { text: async () => adminStartMessage }
     if (!url.includes('api.telegram.org')) return { text: async () => '' }
     const method = new URL(url).pathname.split('/').pop()
     const body = request.body ? JSON.parse(request.body) : {}
@@ -262,7 +266,19 @@ async function testSilentRiskFlow () {
   })
   assert.equal(start.telegram.forwards, 0)
   assert.equal(start.values.has('captcha-5'), false)
-  assert.ok(start.telegram.sent.some(message => !message.reply_markup))
+  assert.equal(start.telegram.sent.at(-1).text, fs.readFileSync('data/startMessage.md', 'utf8'))
+  assert.doesNotMatch(start.telegram.sent.at(-1).text, /管理员使用|管理命令|\/block|信任名单/)
+
+  const adminStart = createHarness()
+  await adminStart.api.onMessage({
+    from: { id: 1 },
+    chat: { id: 1, type: 'private' },
+    message_id: 21,
+    text: '/start'
+  })
+  assert.equal(adminStart.telegram.forwards, 0)
+  assert.equal(adminStart.telegram.sent.at(-1).text, fs.readFileSync('data/adminMessage.md', 'utf8'))
+  assert.match(adminStart.telegram.sent.at(-1).text, /管理员|\/block|信任名单/)
 }
 
 async function testTwoRoundCaptcha () {
