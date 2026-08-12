@@ -54,6 +54,11 @@ const HIGH_RISK_AD_TERMS = [
   '私信代发', '自动获客', '精准获客', '解放双手', '群控', '引流工作室'
 ]
 
+const HIGH_RISK_AD_PATTERNS = [
+  /(?:还在|一键|全自动).{0,24}(?:群发|群.{0,8}发送|批量|获客|采集)/u,
+  /(?:免费|自动).{0,12}(?:采集群|群发|获客)/u
+]
+
 function apiUrl (methodName, params = null) {
   let query = ''
   if (params) query = '?' + new URLSearchParams(params).toString()
@@ -230,7 +235,10 @@ function getMessageRiskScore (message) {
     /@[a-z0-9_]{5,}/i.test(text) || /(?:^|\D)\+?\d[\d\s-]{6,}\d(?:\D|$)/.test(text)
   if (hasContact) score += 3
 
-  if (HIGH_RISK_AD_TERMS.some(term => text.includes(term))) score += 3
+  if (
+    HIGH_RISK_AD_TERMS.some(term => text.includes(term)) ||
+    HIGH_RISK_AD_PATTERNS.some(pattern => pattern.test(text))
+  ) score += 3
 
   const matchedTerms = AD_TERMS.filter(term => text.includes(term)).length
   if (matchedTerms >= 2) score += 3
