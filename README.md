@@ -1,124 +1,270 @@
-## 更新
-
-欢迎使用我们NFD2.0项目🎉，1分钟内快速搭建教程：
-
-> 用户先去[@BotFather](https://t.me/NodeForwardBot/BotFather)，输入 `/newbot` ，按照指引输入你要创建的机器人的昵称和名字，点击复制机器人吐出的token
-> 
-> 然后到[@NodeForwardBot](https://t.me/NodeForwardBot)粘贴，完活。
-> 
-> 详细信息可以参考：[https://www.nodeseek.com/post-286885-1](https://www.nodeseek.com/post-286885-1)
-
-NFD2.0拥有无限配额（自建有每日1k消息上限），且托管在[cloudflare snippets](https://developers.cloudflare.com/rules/snippets/)，理论上不会掉线。如果需要自建，参考下面的自建教程。
-
 # NFD
-No Fraud / Node Forward Bot
 
-一个基于cloudflare worker的telegram 消息转发bot，集成了反欺诈功能
+NFD 是一个运行在 Cloudflare Workers 上的 Telegram 双向私聊转发机器人。
 
-## 特点
-- 基于cloudflare worker搭建，能够实现以下效果
-    - 搭建成本低，一个js文件即可完成搭建
-    - 不需要额外的域名，利用worker自带域名即可
-    - 基于worker kv实现永久数据储存
-    - 稳定，全球cdn转发
-- 接入反欺诈系统，当聊天对象有诈骗历史时，自动发出提醒
-- 支持屏蔽用户，避免被骚扰
-- 仅接收 Telegram 私聊消息，并通过静默风险判断、两轮图标验证、自动信任、广告指纹、UID 限速和静默封禁减少骚扰
+访客向机器人发送消息后，消息会转发给管理员；管理员直接回复该转发消息，即可把回复发送给原访客。项目使用 Workers KV 保存消息映射、信任状态、屏蔽状态和验证会话，并通过静默风控、图标验证、限速及广告指纹减少骚扰消息。
 
-## 搭建方法
-1. 从[@BotFather](https://t.me/BotFather)获取token，并且可以发送`/setjoingroups`来禁止此Bot被添加到群组
-2. 从[uuidgenerator](https://www.uuidgenerator.net/)获取一个随机uuid作为secret
-3. 从[@username_to_id_bot](https://t.me/username_to_id_bot)获取你的用户id
-4. 登录[cloudflare](https://workers.cloudflare.com/)，创建一个worker
-5. 配置worker的变量
-    - 增加一个`ENV_BOT_TOKEN`变量，数值为从步骤1中获得的token
-    - 增加一个`ENV_BOT_SECRET`变量，数值为从步骤2中获得的secret
-    - 增加一个`ENV_ADMIN_UID`变量，数值为从步骤3中获得的用户id
-6. 绑定kv数据库，创建一个Namespace Name为`nfd`的kv数据库，在setting -> variable中设置`KV Namespace Bindings`：nfd -> nfd
-7. 点击`Quick Edit`，复制[这个文件](./worker.js)到编辑器中
-   - 访客 `/start` 说明保存在 [`data/startMessage.md`](./data/startMessage.md)
-   - 管理员 `/start` 说明保存在 [`data/adminMessage.md`](./data/adminMessage.md)
-   - 两份文案会按发送者身份分别读取，可以按需要独立修改
-8. 部署后使用下面的命令注册 Webhook。管理接口只接受 `POST`，并要求与
-   `ENV_BOT_SECRET` 完全一致的 Bearer Token（不要把真实密钥提交到仓库或 shell 历史）：
+> NFD 只处理机器人私聊，不处理群组、超级群组或频道消息。
 
-   ```bash
-   read -rsp 'ENV_BOT_SECRET: ' BOT_SECRET && echo
-   curl --fail-with-body -X POST \
-     -H "Authorization: Bearer ${BOT_SECRET}" \
-     https://xxx.workers.dev/registerWebhook
-   unset BOT_SECRET
-   ```
+## 功能
 
-   如需取消 Webhook，使用相同的认证方式：
+- Telegram 私聊消息双向转发
+- 普通咨询直接转发，可疑消息触发两轮图标验证
+- 管理员首次成功回复后自动信任该访客
+- 支持 `/block`、`/unblock`、`/checkblock` 管理命令
+- 已确认广告生成文本指纹，相同广告再次出现时自动静默屏蔽
+- 按 Telegram UID 进行软限速和临时限制
+- 命中外部欺诈 UID 数据库时提醒管理员
+- 访客和管理员使用独立的 `/start` 说明
+- Webhook 注册和注销接口均要求 Bearer Token 认证
 
-   ```bash
-   read -rsp 'ENV_BOT_SECRET: ' BOT_SECRET && echo
-   curl --fail-with-body -X POST \
-     -H "Authorization: Bearer ${BOT_SECRET}" \
-     https://xxx.workers.dev/unRegisterWebhook
-   unset BOT_SECRET
-   ```
+## 工作流程
+
+1. 访客私聊机器人发送消息。
+2. 已屏蔽、处于临时限制或超过限速的消息会被静默丢弃。
+3. 已信任访客的消息直接转发给管理员。
+4. 未信任访客的消息会进行广告指纹和风险判断：
+   - 低风险消息直接转发；
+   - 达到风险阈值的消息要求完成两轮图标验证；
+   - 命中管理员已确认的广告指纹时，发送者会被自动屏蔽。
+5. 验证成功后，触发验证的原消息会自动转发，无需访客重复发送。
+6. 管理员回复转发消息后，回复会发送给原访客；发送成功后，该访客会加入永久信任名单。
+
+## 项目文件
+
+| 文件 | 用途 |
+| --- | --- |
+| [`worker.js`](./worker.js) | Cloudflare Worker 主程序 |
+| [`worker.test.js`](./worker.test.js) | 使用 Node.js 运行的行为测试 |
+| [`data/startMessage.md`](./data/startMessage.md) | 访客发送 `/start` 时看到的说明 |
+| [`data/adminMessage.md`](./data/adminMessage.md) | 管理员发送 `/start` 时看到的说明 |
+
+## 部署准备
+
+开始前需要准备：
+
+- 一个由 [@BotFather](https://t.me/BotFather) 创建的 Telegram Bot
+- Bot Token
+- 管理员本人的 Telegram 数字 UID
+- 一个 Cloudflare 账号
+- 一个随机 Webhook 密钥，例如使用 `openssl rand -hex 32` 生成
+
+建议在 BotFather 中使用 `/setjoingroups` 禁止机器人被添加到群组。即使没有关闭，Worker 也只会处理私聊更新。
+
+## 部署到 Cloudflare Workers
+
+### 1. 创建 Worker
+
+在 Cloudflare 中创建一个 Worker，将 [`worker.js`](./worker.js) 的完整内容复制到在线编辑器并部署。
+
+该脚本使用 Service Worker 事件监听写法，不需要构建命令或第三方依赖。
+
+### 2. 创建并绑定 KV
+
+创建一个 Workers KV Namespace，然后在 Worker 中添加 KV 绑定：
+
+| 绑定名称 | Namespace |
+| --- | --- |
+| `nfd` | 选择刚创建的 KV Namespace |
+
+绑定名称区分大小写，必须是 `nfd`。
+
+### 3. 配置变量
+
+在 Worker 的变量与机密配置中增加：
+
+| 名称 | 内容 | 建议类型 |
+| --- | --- | --- |
+| `ENV_BOT_TOKEN` | BotFather 提供的 Bot Token | Secret |
+| `ENV_BOT_SECRET` | 自行生成的随机密钥 | Secret |
+| `ENV_ADMIN_UID` | 管理员本人的 Telegram 数字 UID | Text |
+
+`ENV_ADMIN_UID` 应填写管理员个人账号 UID，不是机器人 ID、群组 ID 或频道 ID。
+
+`ENV_BOT_SECRET` 同时用于：
+
+- Telegram Webhook 的 `secret_token`
+- `/registerWebhook` 和 `/unRegisterWebhook` 的 Bearer Token
+
+完成变量和 KV 绑定后，再部署一次 Worker。
+
+### 4. 注册 Webhook
+
+将下面的域名替换为实际 Worker 地址：
+
+```bash
+read -rsp 'ENV_BOT_SECRET: ' BOT_SECRET && echo
+curl --fail-with-body -X POST \
+  -H "Authorization: Bearer ${BOT_SECRET}" \
+  https://your-worker.workers.dev/registerWebhook
+unset BOT_SECRET
+```
+
+返回 `Ok` 表示注册成功。此接口会把 Telegram Webhook 设置为：
+
+```text
+https://your-worker.workers.dev/endpoint
+```
+
+如需注销 Webhook：
+
+```bash
+read -rsp 'ENV_BOT_SECRET: ' BOT_SECRET && echo
+curl --fail-with-body -X POST \
+  -H "Authorization: Bearer ${BOT_SECRET}" \
+  https://your-worker.workers.dev/unRegisterWebhook
+unset BOT_SECRET
+```
+
+管理接口只接受 `POST`。未提供正确 Bearer Token 的请求会被拒绝。
 
 ## 使用方法
-- 当其他用户给bot发消息，会被转发到bot创建者
-- 用户回复普通文字给转发的消息时，会回复到原消息发送者；回复成功后，该用户会自动加入永久信任名单
-- 用户回复`/block`, `/unblock`, `/checkblock`等命令会执行相关指令，**不会**回复到原消息发送者
-- 群组、超级群组和频道消息会被忽略；管理员 UID 不需要验证，也不受访客限速影响
-- 陌生用户发送普通咨询内容时不会看到验证码，消息会直接转发。Worker 只对包含网址、Telegram 链接、联系方式、多个推广词或其他组合风险特征的消息触发验证；单独发送普通截图不会触发验证。
-- 陌生用户的任何转发消息（包括纯文字）都会达到验证阈值；通过其他机器人发送的消息，以及带有 URL、登录链接或 Web App 按钮的消息，也会直接达到验证阈值。因此无需 OCR 也能拦截拆成多条发送的转发广告。
-- `@用户名`、电话号码或邮箱会直接达到验证阈值；“群发、批量私信、采集群、强拉活人、自动获客”等明确推广短语，以及“还在／一键／全自动＋群发／批量／获客／采集”等营销问句结构，也会直接触发验证。陌生用户在 60 秒内继续发送消息会增加 2 分，但普通分段咨询仍低于阈值。
-- 可疑用户需要连续完成两轮图标验证。每轮根据文字提示从随机排列的 6 个图标中选择一个，按钮分为两行；任意一轮选错都会从第一轮重新开始，累计选错 2 次会被限制 1 小时并收到简短提示。
-- 验证会话 10 分钟内有效，有效且已成功发送的题目存在时不会重复发送。可疑消息会保存 10 分钟，连续两轮验证成功后自动转发，无需重新发送。
-- 图标验证只放行当前保存的消息，不会产生临时通行证；同一未信任用户之后再次发送转发消息、链接等可疑内容时，需要重新验证。管理员正常回复成功后，用户才会写入 `trusted-{UID}` 永久信任状态。
-- 管理员对广告消息执行 `/block` 时，会同时撤销该 UID 的永久信任，并保存规范化后的广告文本指纹 30 天；其他 UID 再次发送相同广告时会被静默屏蔽。对原消息执行 `/unblock` 会同时移除对应指纹，便于纠正误判。
-- `/start` 按身份返回访客或管理员说明，不会保存、转发或触发验证；访客文案不公开管理命令和具体风控规则。
-- 图标验证的 `callback_data` 只包含随机 challenge ID 和选项 ID，不包含目标名称或正确答案。
-- 风险判断仅使用当前 Telegram 消息中已有的文本、实体和媒体类型，不依赖外部服务。命中阈值只会触发验证，不会直接封禁；只有命中管理员已经确认的广告指纹才会自动屏蔽。
-- 在 Workers KV 的最终一致性限制下，机器人正常情况保留首次观察到的待验证消息；同一 Worker 实例内会按 UID 串行创建，但不声称跨实例原子性。
-- 验证码创建时先向 Telegram 发送题目，拿到消息 ID 后再将完整的 `active` 状态写入 KV 一次，不会对同一 Key 紧接着执行两次写入。
-- 正确和错误答案都先尝试删除当前 Telegram 验证消息，只有删除成功的回调能继续。删除后使用独立的 challenge claim Key 记录处理权；claim 超过 30 秒且 UID 仍未验证时可重新创建验证，不会永久卡住。
-- 转发成功后，管理员回复映射最多写入 3 次；映射失败不会被误报为转发失败。永久屏蔽、临时限制或超过限速的消息都会被静默丢弃。
+
+### 访客
+
+- 发送 `/start` 查看简短使用说明。
+- 直接发送文字、图片、视频或文件。
+- 普通咨询通常直接转发；出现验证时，根据提示连续选择两次指定图标。
+- 验证成功后，当前原消息会自动发送，无需重复提交。
+
+### 管理员
+
+- 发送 `/start` 查看管理员专用说明。
+- 回复机器人转发的访客消息，回复内容会发送给原访客。
+- 首次成功回复后，访客会自动加入信任名单，以后不再进行风险判断或图标验证。
+- 管理命令必须回复在对应的转发消息上：
+
+| 命令 | 作用 |
+| --- | --- |
+| `/block` | 永久屏蔽该访客、撤销信任，并记录该消息的广告指纹 |
+| `/unblock` | 解除屏蔽，并移除该消息对应的广告指纹 |
+| `/checkblock` | 检查该访客当前是否被屏蔽 |
+
+管理命令不会发送给访客。管理员 UID 不进行访客风控和限速。
+
+## 静默风控
+
+风险分达到 `3` 时触发验证。当前代码使用下列信号累计风险分：
+
+| 信号 | 风险分 |
+| --- | ---: |
+| URL、Telegram 链接或常见域名 | +3 |
+| `@用户名`、电话号码或邮箱 | +3 |
+| 明确广告短语或组合营销句式 | +3 |
+| 同一消息命中两个或更多普通推广词 | +3 |
+| 命中一个普通推广词 | +1 |
+| 图片、视频、动画或文件 | +1 |
+| Telegram 转发消息，包括纯文字 | +3 |
+| 通过其他机器人发送 | +3 |
+| 带外部 URL、登录链接或 Web App 的按钮 | +3 |
+| 多行堆叠内容或异常重复字符 | +1 |
+| 未信任访客在首次消息后的 60 秒内继续发送 | +2 |
+
+这些分数可以叠加。单独发送普通截图通常不会触发验证，普通的两段式咨询也不会仅因连续发送而达到阈值。
+
+命中风险阈值只会触发验证，不会直接屏蔽访客。只有管理员执行 `/block` 后产生的广告指纹，才会用于自动静默屏蔽其他发送相同广告的 UID。
+
+## 图标验证
+
+- 每轮显示 6 个随机图标，访客按文字提示选择目标图标。
+- 需要连续完成 2 轮。
+- 任意一轮选错后会从第 1 轮重新开始。
+- 累计选错 2 次会被限制 1 小时。
+- 验证会话和待转发消息保留 10 分钟。
+- 同一会话正常只保留首次触发验证的消息。
+- 验证成功只放行当前保存的消息，不提供临时免验证时段。
+- 未被管理员信任的访客之后再次发送可疑消息时，需要重新验证。
 
 ## 防骚扰限速
 
-限速按 Telegram UID 计算，管理员除外：
+限速按访客 Telegram UID 计算：
 
 - 每分钟最多处理 5 条消息
 - 每小时最多处理 20 条消息
-- 超额消息不作回复，也不会转发
-- 同一分钟窗口无论丢弃多少条消息，最多记录一次限速触发
-- 最近一小时内有 3 个不同分钟窗口触发限速后，该 UID 会被静默封禁 24 小时
+- 超额消息静默丢弃
+- 同一分钟窗口最多记录一次超限触发
+- 最近一小时内有 3 个不同分钟窗口触发超限后，静默限制该 UID 24 小时
 
-这些计数是基于 Cloudflare KV 最终一致性模型的 **best-effort 软限速**，不是严格原子限速。
-每个 UID 使用一个 strike 状态，并用分钟窗口集合去重，因此并发读取延迟可能导致少计、状态覆盖
-或延迟封禁，但同一次状态更新不会把同一分钟重复累计成多个触发。它主要用于普通的机器人私聊
-防骚扰场景。如果计数写入遇到 KV 同 Key 写入限制或短暂故障，消息会正常继续处理，避免误丢正常用户消息。
+限速基于 Workers KV 的最终一致性模型，是 best-effort 软限速，不是严格原子计数。计数写入遇到 KV 同 Key 写入限制或短暂故障时，代码会允许消息继续处理，避免正常访客因计数故障被误丢弃。
+
+## 欺诈 UID 提醒
+
+消息成功转发后，Worker 会检查发送者 UID 是否存在于 `worker.js` 中 `fraudDb` 指向的外部数据库。命中时，管理员会收到“检测到骗子”的提醒。
+
+当前数据源为：
+
+```text
+https://raw.githubusercontent.com/LloydAsp/nfd/main/data/fraud.db
+```
+
+如需使用自己的欺诈 UID 列表，请修改 `worker.js` 中的 `fraudDb`。文件格式为每行一个 UID。
+
+## 远程文案
+
+访客和管理员 `/start` 文案会在收到命令时从 GitHub `main` 分支实时读取：
+
+- `data/startMessage.md`
+- `data/adminMessage.md`
+
+因此只修改这两个文案并合并到 `main` 后，通常不需要重新部署 Worker。GitHub Raw 缓存可能导致更新短暂延迟。
+
+如果使用 Fork 部署，请把 `worker.js` 中的 `startMsgUrl` 和 `adminMsgUrl` 改为自己的仓库地址，否则机器人仍会读取本仓库的文案。
+
+## Worker 路由
+
+| 路径 | 方法 | 用途 |
+| --- | --- | --- |
+| `/endpoint` | `POST` | 接收 Telegram Webhook；校验 `X-Telegram-Bot-Api-Secret-Token` |
+| `/registerWebhook` | `POST` | 注册 Webhook；要求 Bearer Token |
+| `/unRegisterWebhook` | `POST` | 注销 Webhook；要求 Bearer Token |
+| 其他路径 | 任意 | 返回 `404` |
 
 ## KV 数据
 
-继续使用现有的 `nfd` KV 绑定，不需要增加依赖或新的 Namespace。主要键如下：
+所有状态继续使用同一个 `nfd` KV Namespace：
 
-| 键 | 内容与有效期 |
+| Key | 内容与有效期 |
 | --- | --- |
-| `trusted-{UID}` | 管理员成功回复该用户后的永久信任状态；信任用户不再进行风险判断或图标验证 |
-| `captcha-{UID}` | 当前图标题的随机 ID、UID、轮次、目标名称、6 个图标选项、正确选项 ID、失败次数、状态、聊天/消息信息和过期时间，10 分钟；完成后写入短期 `completed` 状态，必须更新时至少间隔 1100 毫秒 |
-| `captcha-claim-{challengeId}` | Telegram 验证消息删除成功后的 UID 和 `claimedAt`；每个 challenge 只写一次，TTL 不超过当前验证会话 |
-| `pending-message-{UID}` | 保留当前验证会话首次观察到的消息 chat ID、message ID、状态和 `expiresAt`；验证完成后标记为 `completed`，下一次可疑消息会建立新会话 |
-| `captcha-block-{UID}` | 连续验证失败后的静默限制，1 小时 |
-| `rate-minute-{UID}-{窗口}` | 分钟窗口消息计数（键额外保留约 2 分钟） |
-| `rate-hour-{UID}-{窗口}` | 小时窗口消息计数（键额外保留约 2 小时） |
-| `rate-strikes-{UID}` | `{ "windows": [分钟窗口, ...] }`，保存最近一小时内不同的超限分钟窗口，有效期1小时 |
-| `rate-block-{UID}` | 达到 3 次限速触发后的静默封禁，24 小时 |
-| `untrusted-window-{UID}` | 陌生用户第一次消息的时间，保存约 2 分钟；60 秒内的后续消息增加 2 分风险 |
-| `isblocked-{UID}` | 管理员通过 `/block` 设置的永久屏蔽状态 |
-| `spam-fingerprint-{SHA256}` | 管理员确认的规范化广告文本指纹及来源 UID，保存 30 天 |
-| `msg-map-{消息ID}` | 转发给管理员的消息 ID 到访客 chat ID 的映射；管理员回复依赖此键 |
+| `trusted-{UID}` | 管理员成功回复后的永久信任状态 |
+| `isblocked-{UID}` | 管理员设置的屏蔽状态 |
+| `msg-map-{消息ID}` | 管理员端消息 ID 到访客 chat ID 的映射 |
+| `spam-fingerprint-{SHA256}` | 管理员确认的广告文本指纹，保留 30 天 |
+| `captcha-{UID}` | 当前验证状态，最长约 10 分钟 |
+| `captcha-claim-{challengeId}` | 验证回调处理权，TTL 不超过当前会话 |
+| `pending-message-{UID}` | 当前待验证消息，最长约 10 分钟 |
+| `captcha-block-{UID}` | 验证失败后的 1 小时限制 |
+| `untrusted-window-{UID}` | 未信任访客短时间连续发送状态，约 2 分钟 |
+| `rate-minute-{UID}-{窗口}` | 分钟计数，约 2 分钟 |
+| `rate-hour-{UID}-{窗口}` | 小时计数，约 2 小时 |
+| `rate-strikes-{UID}` | 最近一小时的超限分钟窗口 |
+| `rate-block-{UID}` | 多次超限后的 24 小时限制 |
 
-## 欺诈数据源
-- 文件[fraud.db](./fraud.db)为欺诈数据，格式为每行一个uid
-- 可以通过pr扩展本数据，也可以通过提issue方式补充
-- 提供额外欺诈信息时，需要提供一定的消息出处
+Workers KV 是最终一致性存储。代码会尽量避开同一 Key 每秒多次写入，并对关键消息映射进行有限重试，但不提供跨 Worker 实例的强原子保证。
 
-## Thanks
+## 测试
+
+测试只使用 Node.js 内置模块，建议使用 Node.js 18 或更高版本：
+
+```bash
+node --check worker.js
+node --check worker.test.js
+node worker.test.js
+```
+
+测试包含普通消息、拆分广告、两轮验证、重复回调、KV 写入限制、消息映射、自动信任、广告指纹和失败恢复等场景。测试中的部分错误日志来自故障模拟，最终出现以下内容即表示通过：
+
+```text
+worker tests passed with silent risk control and KV write-limit enforcement
+```
+
+## 更新说明
+
+- 修改 `worker.js` 后，需要在 Cloudflare 中替换代码并重新部署。
+- 只修改访客或管理员 `/start` 文案时，通常不需要重新部署 Worker。
+- Worker 地址、Bot Token 和 `ENV_BOT_SECRET` 未变化时，不需要重新注册 Webhook。
+- 更新代码不需要重建 KV Namespace，也不要删除原有 KV 数据。
+- Bot Token 或 Webhook 密钥一旦泄露，应立即轮换；不要把真实密钥提交到仓库、命令记录或公开聊天中。
+
+## 致谢
+
 - [telegram-bot-cloudflare](https://github.com/cvzi/telegram-bot-cloudflare)
