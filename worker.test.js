@@ -85,7 +85,7 @@ function createHarness () {
     ;globalThis.testApi = {
       createCaptcha, savePendingMessage, ensureCaptcha, onCallbackQuery, onMessage,
       forwardGuestMessage, handleAdminMessage, getMessageRiskScore,
-      getMessageFingerprint, getCurrentVerification
+      getMessageFingerprint
     }
   `
   const context = {
@@ -181,6 +181,48 @@ async function testSilentRiskFlow () {
     [3, 3]
   )
 
+  const forwardedTextBurst = createHarness()
+  await forwardedTextBurst.api.onMessage({
+    from: { id: 7 },
+    chat: { id: 7, type: 'private' },
+    message_id: 30,
+    text: '还在一个一个群手动点发送？',
+    forward_origin: { type: 'user' }
+  })
+  await forwardedTextBurst.api.onMessage({
+    from: { id: 7 },
+    chat: { id: 7, type: 'private' },
+    message_id: 31,
+    text: '一键开启全自动群发，真正解放双手。',
+    forward_origin: { type: 'user' }
+  })
+  assert.equal(forwardedTextBurst.telegram.forwards, 0)
+  assert.equal(JSON.parse(forwardedTextBurst.values.get('pending-message-7')).messageId, 30)
+  assert.equal(forwardedTextBurst.telegram.sent.filter(message => message.reply_markup).length, 1)
+
+  const splitDirectAd = createHarness()
+  await splitDirectAd.api.onMessage({
+    from: { id: 8 },
+    chat: { id: 8, type: 'private' },
+    message_id: 40,
+    text: '还在一个一个群手动点发送？'
+  })
+  await splitDirectAd.api.onMessage({
+    from: { id: 8 },
+    chat: { id: 8, type: 'private' },
+    message_id: 41,
+    text: '一键开启全自动群发，真正解放双手。'
+  })
+  await splitDirectAd.api.onMessage({
+    from: { id: 8 },
+    chat: { id: 8, type: 'private' },
+    message_id: 42,
+    text: '频道：@FzdN1'
+  })
+  assert.equal(splitDirectAd.telegram.forwards, 0)
+  assert.equal(JSON.parse(splitDirectAd.values.get('pending-message-8')).messageId, 40)
+  assert.equal(splitDirectAd.telegram.sent.filter(message => message.reply_markup).length, 1)
+
   const forwardedMediaAd = createHarness()
   await forwardedMediaAd.api.onMessage({
     from: { id: 6 },
@@ -197,7 +239,10 @@ async function testSilentRiskFlow () {
   assert.ok(forwardedMediaAd.values.has('captcha-6'))
 
   const oldVerification = createHarness()
-  oldVerification.values.set('verified-3', 'true')
+  oldVerification.values.set('verified-3', JSON.stringify({
+    version: 2,
+    expiresAt: Date.now() + 60000
+  }))
   await oldVerification.api.onMessage(suspiciousMessage(3, 11))
   assert.ok(oldVerification.values.has('captcha-3'))
   assert.equal(oldVerification.telegram.forwards, 0)
@@ -236,11 +281,22 @@ async function testTwoRoundCaptcha () {
   assert.equal(h.values.has('verified-2'), false)
 
   await h.api.onCallbackQuery(callback('2', second))
-  const verified = JSON.parse(h.values.get('verified-2'))
-  assert.equal(verified.version, 2)
-  assert.ok(verified.expiresAt > Date.now())
+  assert.equal(h.values.has('verified-2'), false)
+  assert.equal(JSON.parse(h.values.get('captcha-2')).status, 'completed')
+  assert.equal(JSON.parse(h.values.get('pending-message-2')).status, 'completed')
   assert.equal(h.telegram.forwards, 1)
   assert.match(h.telegram.sent.at(-1).text, /验证成功/)
+
+  await h.api.onMessage({
+    from: { id: 2 },
+    chat: { id: 2, type: 'private' },
+    message_id: 11,
+    text: '另一条转发广告',
+    forward_origin: { type: 'user' }
+  })
+  assert.equal(h.telegram.forwards, 1)
+  assert.equal(JSON.parse(h.values.get('captcha-2')).status, 'active')
+  assert.equal(JSON.parse(h.values.get('pending-message-2')).messageId, 11)
 }
 
 async function testDelayedDuplicateCorrectAnswer () {
@@ -346,7 +402,8 @@ async function testCaptchaClaimRetries () {
   exhausted.telegram.claimFailures = 3
   await exhausted.api.onCallbackQuery(callback('2', exhaustedState))
   assert.equal(exhausted.values.has(`captcha-claim-${exhaustedState.id}`), false)
-  assert.equal(JSON.parse(exhausted.values.get('verified-2')).version, 2)
+  assert.equal(exhausted.values.has('verified-2'), false)
+  assert.equal(JSON.parse(exhausted.values.get('captcha-2')).status, 'completed')
   assert.equal(exhausted.telegram.forwards, 1)
 }
 
@@ -470,9 +527,14 @@ async function testRiskScoring () {
   assert.equal(h.api.getMessageRiskScore({ text: '你好，我想咨询问题' }), 0)
   assert.ok(h.api.getMessageRiskScore({ text: '请查看 https://example.com' }) >= 3)
   assert.ok(h.api.getMessageRiskScore({ text: '投资合作请联系我 @example_user' }) >= 3)
+  assert.ok(h.api.getMessageRiskScore({ text: '频道：@example_user' }) >= 3)
+  assert.ok(h.api.getMessageRiskScore({ text: '一键开启全自动群发' }) >= 3)
+  assert.ok(h.api.getMessageRiskScore({ text: '还在一个一个群手动点发送？' }) >= 3)
+  assert.ok(h.api.getMessageRiskScore({ text: '群里消息为什么发送不出去？' }) < 3)
   assert.ok(h.api.getMessageRiskScore({ photo: [{}], caption: '问题截图' }) < 3)
+  assert.ok(h.api.getMessageRiskScore({ text: '普通转发文字', forward_origin: { type: 'user' } }) >= 3)
   assert.ok(h.api.getMessageRiskScore({ photo: [{}], forward_origin: { type: 'user' } }) >= 3)
-  assert.ok(h.api.getMessageRiskScore({ photo: [{}], via_bot: { is_bot: true } }) >= 3)
+  assert.ok(h.api.getMessageRiskScore({ text: '机器人代发文字', via_bot: { is_bot: true } }) >= 3)
   assert.ok(h.api.getMessageRiskScore({
     reply_markup: { inline_keyboard: [[{ text: '打开', url: 'https://example.com' }]] }
   }) >= 3)

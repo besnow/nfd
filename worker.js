@@ -9,8 +9,8 @@ const CAPTCHA_BLOCK_SECONDS = 60 * 60
 const CAPTCHA_ROUNDS = 2
 const CAPTCHA_MAX_FAILURES = 2
 const CAPTCHA_VERSION = 2
-const VERIFIED_TTL_SECONDS = 24 * 60 * 60
 const RISK_THRESHOLD = 3
+const UNTRUSTED_BURST_SECONDS = 60
 const SPAM_FINGERPRINT_TTL_SECONDS = 30 * 24 * 60 * 60
 const RATE_BLOCK_SECONDS = 24 * 60 * 60
 const fraudDb = 'https://raw.githubusercontent.com/LloydAsp/nfd/main/data/fraud.db'
@@ -47,6 +47,16 @@ const AD_TERMS = [
   '广告', '推广', '引流', '返佣', '赚钱', '兼职', '投资', '高收益',
   '稳赚', '博彩', '娱乐城', '担保', '空投', '币圈', '代购', '出售',
   '免费领取', '充值', '优惠', '折扣', '代理', '合作', '联系我', '加入频道'
+]
+
+const HIGH_RISK_AD_TERMS = [
+  '群发', '批量发送', '批量私信', '采集群', '采集群组', '强拉活人',
+  '私信代发', '自动获客', '精准获客', '解放双手', '群控', '引流工作室'
+]
+
+const HIGH_RISK_AD_PATTERNS = [
+  /(?:还在|一键|全自动).{0,24}(?:群发|群.{0,8}发送|批量|获客|采集)/u,
+  /(?:免费|自动).{0,12}(?:采集群|群发|获客)/u
 ]
 
 function apiUrl (methodName, params = null) {
@@ -143,8 +153,8 @@ async function onMessage (message) {
     return
   }
 
-  const verified = await getCurrentVerification(uid)
-  if (getMessageRiskScore(message) >= RISK_THRESHOLD && !verified) {
+  const riskScore = getMessageRiskScore(message) + await getUntrustedBurstRisk(uid)
+  if (riskScore >= RISK_THRESHOLD) {
     const pending = await savePendingMessage(message)
     await ensureCaptcha(message, pending)
     return
@@ -223,7 +233,12 @@ function getMessageRiskScore (message) {
   const hasContact = entityTypes.has('mention') || entityTypes.has('text_mention') ||
     entityTypes.has('phone_number') || entityTypes.has('email') ||
     /@[a-z0-9_]{5,}/i.test(text) || /(?:^|\D)\+?\d[\d\s-]{6,}\d(?:\D|$)/.test(text)
-  if (hasContact) score += 2
+  if (hasContact) score += 3
+
+  if (
+    HIGH_RISK_AD_TERMS.some(term => text.includes(term)) ||
+    HIGH_RISK_AD_PATTERNS.some(pattern => pattern.test(text))
+  ) score += 3
 
   const matchedTerms = AD_TERMS.filter(term => text.includes(term)).length
   if (matchedTerms >= 2) score += 3
@@ -232,14 +247,31 @@ function getMessageRiskScore (message) {
   const hasMedia = Boolean(message.photo || message.video || message.animation || message.document)
   const isForwarded = Boolean(message.forward_origin || message.forward_from || message.forward_from_chat)
   if (hasMedia) score += 1
-  // Forwarded media is a common ad container. Plain forwarded text stays low
-  // risk, while forwarded images/videos reach the challenge threshold.
-  if (isForwarded) score += hasMedia ? 2 : 1
-  if (message.via_bot) score += 2
+  // Unknown users can forward an entire ad as several harmless-looking text
+  // messages, so every forwarded message must reach the challenge threshold.
+  if (isForwarded) score += 3
+  if (message.via_bot) score += 3
   if (hasExternalInlineButton(message)) score += 3
   if ((text.match(/\n/g) || []).length >= 4 || /(.)\1{7,}/u.test(text)) score += 1
 
   return score
+}
+
+async function getUntrustedBurstRisk (uid) {
+  const key = 'untrusted-window-' + uid
+  const now = Date.now()
+  const state = await nfd.get(key, { type: 'json' })
+  if (state?.startedAt && now - state.startedAt <= UNTRUSTED_BURST_SECONDS * 1000) return 2
+  try {
+    await nfd.put(key, JSON.stringify({ startedAt: now }), {
+      expirationTtl: UNTRUSTED_BURST_SECONDS * 2
+    })
+  } catch (error) {
+    // This is an additional best-effort signal. A failure must not block a
+    // legitimate first contact; the content score still applies normally.
+    console.error(`untrusted burst state write failed for UID ${uid}: ${error}`)
+  }
+  return 0
 }
 
 function normalizeMessageForFingerprint (message) {
@@ -259,12 +291,6 @@ async function getMessageFingerprint (message) {
   if (!normalized) return null
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(normalized))
   return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('')
-}
-
-async function getCurrentVerification (uid) {
-  const verified = await nfd.get('verified-' + uid, { type: 'json' })
-  if (!verified || verified.version !== CAPTCHA_VERSION || verified.expiresAt <= Date.now()) return null
-  return verified
 }
 
 async function silentlyBlockKnownSpam (uid) {
@@ -336,11 +362,15 @@ async function savePendingMessage (message, expiresAt = null) {
   const current = previous.then(async () => {
     const key = 'pending-message-' + uid
     const existing = await nfd.get(key, { type: 'json' })
-    if (existing) return existing
+    if (existing && existing.status !== 'completed' && existing.expiresAt > Date.now()) return existing
+    if (existing?.status === 'completed') await waitForStateWrite(existing)
+    const now = Date.now()
     const pending = {
       chatId: message.chat.id,
       messageId: message.message_id,
-      expiresAt: expiresAt || Date.now() + CAPTCHA_TTL_SECONDS * 1000
+      status: 'active',
+      writtenAt: now,
+      expiresAt: expiresAt || now + CAPTCHA_TTL_SECONDS * 1000
     }
     const ttl = remainingTtl(pending.expiresAt)
     if (ttl > 0) await nfd.put(key, JSON.stringify(pending), { expirationTtl: ttl })
@@ -358,9 +388,45 @@ function wait (milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds))
 }
 
-async function waitForCaptchaWrite (state) {
+async function waitForStateWrite (state) {
   const elapsed = Date.now() - (state?.writtenAt || state?.createdAt || 0)
   if (elapsed < 1100) await wait(1100 - elapsed)
+}
+
+async function waitForCaptchaWrite (state) {
+  await waitForStateWrite(state)
+}
+
+async function markStateCompleted (key, state, label) {
+  if (!state) return false
+  await waitForStateWrite(state)
+  const completed = {
+    status: 'completed',
+    version: state.version,
+    id: state.id,
+    userId: state.userId,
+    chatId: state.chatId,
+    messageId: state.messageId,
+    createdAt: state.createdAt,
+    completedAt: Date.now(),
+    expiresAt: state.expiresAt,
+    writtenAt: Date.now()
+  }
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (attempt > 1) {
+      await wait(1100)
+      completed.writtenAt = Date.now()
+    }
+    try {
+      await nfd.put(key, JSON.stringify(completed), {
+        expirationTtl: remainingTtl(state.expiresAt) || 60
+      })
+      return true
+    } catch (error) {
+      if (attempt === 3) console.error(`${label} completion write failed: ${error}`)
+    }
+  }
+  return false
 }
 
 async function sendAndStoreCaptcha (key, challenge) {
@@ -422,14 +488,16 @@ async function ensureCaptcha (message, pending = null) {
     if (existing?.version === CAPTCHA_VERSION && existing.status === 'active' && existing.messageId && existing.expiresAt > now) {
       const claim = await nfd.get('captcha-claim-' + existing.id, { type: 'json' })
       if (!claim || now - claim.claimedAt <= CAPTCHA_PROCESSING_TIMEOUT_MS) return
-      if (await getCurrentVerification(uid)) return
+      await waitForCaptchaWrite(existing)
+    } else if (existing?.status === 'completed') {
       await waitForCaptchaWrite(existing)
     }
 
-    const expiresAt = existing?.expiresAt > now
+    const continuesActiveSession = existing?.status === 'active' && existing.expiresAt > now
+    const expiresAt = continuesActiveSession
       ? existing.expiresAt
       : pending?.expiresAt > now ? pending.expiresAt : now + CAPTCHA_TTL_SECONDS * 1000
-    const failures = existing?.expiresAt > now ? existing.failures || 0 : 0
+    const failures = continuesActiveSession ? existing.failures || 0 : 0
     const challenge = createCaptcha(uid, message.chat.id, failures, null, expiresAt, 1)
     await sendAndStoreCaptcha(key, challenge)
   })
@@ -501,13 +569,6 @@ async function onCallbackQuery (query) {
       return
     }
 
-    const verifiedAt = Date.now()
-    await nfd.put('verified-' + uid, JSON.stringify({
-      version: CAPTCHA_VERSION,
-      verifiedAt,
-      expiresAt: verifiedAt + VERIFIED_TTL_SECONDS * 1000
-    }), { expirationTtl: VERIFIED_TTL_SECONDS })
-
     const pendingKey = 'pending-message-' + uid
     const pending = await nfd.get(pendingKey, { type: 'json' })
     let resultText = '✅ 验证成功，请发送您的问题。'
@@ -526,6 +587,10 @@ async function onCallbackQuery (query) {
         }
       }
     }
+    await Promise.allSettled([
+      markStateCompleted(stateKey, state, `captcha state for UID ${uid}`),
+      markStateCompleted(pendingKey, pending, `pending message for UID ${uid}`)
+    ])
     await sendMessage({ chat_id: state.chatId, text: resultText })
   } finally {
     // Telegram requires every callback to be acknowledged, including ignored stale callbacks.
