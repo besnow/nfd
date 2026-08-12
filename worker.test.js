@@ -219,8 +219,8 @@ async function testSilentRiskFlow () {
     message_id: 42,
     text: '频道：@FzdN1'
   })
-  assert.equal(splitDirectAd.telegram.forwards, 1)
-  assert.equal(JSON.parse(splitDirectAd.values.get('pending-message-8')).messageId, 41)
+  assert.equal(splitDirectAd.telegram.forwards, 0)
+  assert.equal(JSON.parse(splitDirectAd.values.get('pending-message-8')).messageId, 40)
   assert.equal(splitDirectAd.telegram.sent.filter(message => message.reply_markup).length, 1)
 
   const forwardedMediaAd = createHarness()
@@ -529,6 +529,8 @@ async function testRiskScoring () {
   assert.ok(h.api.getMessageRiskScore({ text: '投资合作请联系我 @example_user' }) >= 3)
   assert.ok(h.api.getMessageRiskScore({ text: '频道：@example_user' }) >= 3)
   assert.ok(h.api.getMessageRiskScore({ text: '一键开启全自动群发' }) >= 3)
+  assert.ok(h.api.getMessageRiskScore({ text: '还在一个一个群手动点发送？' }) >= 3)
+  assert.ok(h.api.getMessageRiskScore({ text: '群里消息为什么发送不出去？' }) < 3)
   assert.ok(h.api.getMessageRiskScore({ photo: [{}], caption: '问题截图' }) < 3)
   assert.ok(h.api.getMessageRiskScore({ text: '普通转发文字', forward_origin: { type: 'user' } }) >= 3)
   assert.ok(h.api.getMessageRiskScore({ photo: [{}], forward_origin: { type: 'user' } }) >= 3)
