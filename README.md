@@ -36,7 +36,9 @@ No Fraud / Node Forward Bot
     - 增加一个`ENV_ADMIN_UID`变量，数值为从步骤3中获得的用户id
 6. 绑定kv数据库，创建一个Namespace Name为`nfd`的kv数据库，在setting -> variable中设置`KV Namespace Bindings`：nfd -> nfd
 7. 点击`Quick Edit`，复制[这个文件](./worker.js)到编辑器中
-   - `/start` 返回的使用说明保存在 [`data/startMessage.md`](./data/startMessage.md)，可以按需要修改
+   - 访客 `/start` 说明保存在 [`data/startMessage.md`](./data/startMessage.md)
+   - 管理员 `/start` 说明保存在 [`data/adminMessage.md`](./data/adminMessage.md)
+   - 两份文案会按发送者身份分别读取，可以按需要独立修改
 8. 部署后使用下面的命令注册 Webhook。管理接口只接受 `POST`，并要求与
    `ENV_BOT_SECRET` 完全一致的 Bearer Token（不要把真实密钥提交到仓库或 shell 历史）：
 
@@ -70,7 +72,7 @@ No Fraud / Node Forward Bot
 - 验证会话 10 分钟内有效，有效且已成功发送的题目存在时不会重复发送。可疑消息会保存 10 分钟，连续两轮验证成功后自动转发，无需重新发送。
 - 图标验证只放行当前保存的消息，不会产生临时通行证；同一未信任用户之后再次发送转发消息、链接等可疑内容时，需要重新验证。管理员正常回复成功后，用户才会写入 `trusted-{UID}` 永久信任状态。
 - 管理员对广告消息执行 `/block` 时，会同时撤销该 UID 的永久信任，并保存规范化后的广告文本指纹 30 天；其他 UID 再次发送相同广告时会被静默屏蔽。对原消息执行 `/unblock` 会同时移除对应指纹，便于纠正误判。
-- `/start` 直接返回欢迎信息，不会保存、转发或触发验证。
+- `/start` 按身份返回访客或管理员说明，不会保存、转发或触发验证；访客文案不公开管理命令和具体风控规则。
 - 图标验证的 `callback_data` 只包含随机 challenge ID 和选项 ID，不包含目标名称或正确答案。
 - 风险判断仅使用当前 Telegram 消息中已有的文本、实体和媒体类型，不依赖外部服务。命中阈值只会触发验证，不会直接封禁；只有命中管理员已经确认的广告指纹才会自动屏蔽。
 - 在 Workers KV 的最终一致性限制下，机器人正常情况保留首次观察到的待验证消息；同一 Worker 实例内会按 UID 串行创建，但不声称跨实例原子性。
