@@ -708,6 +708,25 @@ async function testUnblockRevocationFailureKeepsBan () {
   assert.equal(h.telegram.forwards, 0)
 }
 
+async function testReplyImmediatelyAfterUnblockGrantsTrust () {
+  const h = createHarness()
+  h.values.set('msg-map-700', '2')
+  h.values.set('isblocked-2', 'true')
+  const adminMessage = {
+    ...visitorMessage('/unblock', 1, 30),
+    reply_to_message: { message_id: 700, chat: { id: 1 }, text: '你好' }
+  }
+  await h.api.handleAdminMessage(adminMessage)
+  // /unblock just deleted the same trusted key. A successful ordinary reply
+  // must still grant permanent trust, without sending the reply more than once.
+  await h.api.handleAdminMessage({ ...adminMessage, text: '可以继续联系了', message_id: 31 })
+  assert.equal(h.telegram.copies.length, 1)
+  assert.ok(h.values.has('trusted-2'))
+  h.advance(25 * 60 * 60 * 1000)
+  await h.api.onMessage(visitorMessage('再次联系', 2, 11))
+  assert.equal(h.telegram.forwards, 1)
+  assert.equal(h.values.has('captcha-2'), false)
+}
 
 async function main () {
   await testFirstContactGate()
@@ -718,6 +737,7 @@ async function main () {
   await testBlocksOverrideTrustAndVerification()
   await testImmediateBlockAndUnblockRevokesPermissions()
   await testUnblockRevocationFailureKeepsBan()
+  await testReplyImmediatelyAfterUnblockGrantsTrust()
   await testDelayedDuplicateCorrectAnswer()
   await testWrongAnswersAndConcurrency()
   await testDeleteFailureAndClaimRecovery()

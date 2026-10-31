@@ -218,10 +218,16 @@ async function handleAdminMessage (message) {
   if (result?.ok === true) {
     const trustKey = 'trusted-' + guestChatId
     if (!await nfd.get(trustKey, { type: 'json' })) {
-      try {
-        await nfd.put(trustKey, JSON.stringify({ trustedAt: Date.now() }))
-      } catch (error) {
-        console.error(`automatic trust write failed for UID ${guestChatId}: ${error}`)
+      // /unblock may just have deleted this key. Retry only the KV grant, never
+      // the Telegram reply that has already been delivered successfully.
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        if (attempt > 1) await wait(1100)
+        try {
+          await nfd.put(trustKey, JSON.stringify({ trustedAt: Date.now() }))
+          break
+        } catch (error) {
+          if (attempt === 3) console.error(`automatic trust write failed for UID ${guestChatId}: ${error}`)
+        }
       }
     }
   }
