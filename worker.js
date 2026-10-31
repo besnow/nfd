@@ -9,8 +9,8 @@ const CAPTCHA_BLOCK_SECONDS = 60 * 60
 const CAPTCHA_ROUNDS = 2
 const CAPTCHA_MAX_FAILURES = 2
 const CAPTCHA_VERSION = 2
-const RISK_THRESHOLD = 3
-const UNTRUSTED_BURST_SECONDS = 60
+const VERIFIED_VERSION = 3
+const VERIFIED_TTL_SECONDS = 24 * 60 * 60
 const SPAM_FINGERPRINT_TTL_SECONDS = 30 * 24 * 60 * 60
 const RATE_BLOCK_SECONDS = 24 * 60 * 60
 const fraudDb = 'https://raw.githubusercontent.com/LloydAsp/nfd/main/data/fraud.db'
@@ -42,22 +42,6 @@ const CAPTCHA_ICONS = [
   { label: '猴子', icon: '🐵' }, { label: '小鸡', icon: '🐥' },
   { label: '企鹅', icon: '🐧' }, { label: '鲸鱼', icon: '🐳' },
   { label: '章鱼', icon: '🐙' }, { label: '蝴蝶', icon: '🦋' }
-]
-
-const AD_TERMS = [
-  '广告', '推广', '引流', '返佣', '赚钱', '兼职', '投资', '高收益',
-  '稳赚', '博彩', '娱乐城', '担保', '空投', '币圈', '代购', '出售',
-  '免费领取', '充值', '优惠', '折扣', '代理', '合作', '联系我', '加入频道'
-]
-
-const HIGH_RISK_AD_TERMS = [
-  '群发', '批量发送', '批量私信', '采集群', '采集群组', '强拉活人',
-  '私信代发', '自动获客', '精准获客', '解放双手', '群控', '引流工作室'
-]
-
-const HIGH_RISK_AD_PATTERNS = [
-  /(?:还在|一键|全自动).{0,24}(?:群发|群.{0,8}发送|批量|获客|采集)/u,
-  /(?:免费|自动).{0,12}(?:采集群|群发|获客)/u
 ]
 
 function apiUrl (methodName, params = null) {
@@ -147,6 +131,7 @@ async function onMessage (message) {
   if (await nfd.get('trusted-' + uid, { type: 'json' })) {
     return handleGuestMessage(message)
   }
+  if (await isVerified(uid)) return handleGuestMessage(message)
 
   const fingerprint = await getMessageFingerprint(message)
   if (fingerprint && await nfd.get('spam-fingerprint-' + fingerprint, { type: 'json' })) {
@@ -154,14 +139,56 @@ async function onMessage (message) {
     return
   }
 
-  const riskScore = getMessageRiskScore(message) + await getUntrustedBurstRisk(uid)
-  if (riskScore >= RISK_THRESHOLD) {
-    const pending = await savePendingMessage(message)
-    await ensureCaptcha(message, pending)
-    return
-  }
+  // Greetings and follow-up messages must pass the same gate as media and links.
+  // Keep only the first message while the visitor completes verification.
+  const pending = await savePendingMessage(message)
+  await ensureCaptcha(message, pending)
+}
 
-  return handleGuestMessage(message)
+async function isVerified (uid) {
+  const state = await nfd.get('verified-' + uid, { type: 'json' })
+  return state?.version === VERIFIED_VERSION &&
+    Number.isFinite(state.expiresAt) && state.expiresAt > Date.now()
+}
+
+async function saveVerificationSession (uid) {
+  const verifiedAt = Date.now()
+  const state = {
+    version: VERIFIED_VERSION,
+    verifiedAt,
+    expiresAt: verifiedAt + VERIFIED_TTL_SECONDS * 1000
+  }
+  // Do not forward until the verification grant has been saved. The timestamp
+  // is fixed here; subsequent visitor messages never extend this session.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (attempt > 1) await wait(1100)
+    try {
+      await nfd.put('verified-' + uid, JSON.stringify(state), {
+        expirationTtl: VERIFIED_TTL_SECONDS
+      })
+      return true
+    } catch (error) {
+      if (attempt === 3) console.error(`verification grant write failed for UID ${uid}: ${error}`)
+    }
+  }
+  return false
+}
+
+async function revokeVisitorAccess (uid) {
+  const keys = ['trusted-', 'verified-', 'captcha-', 'pending-message-']
+  const results = await Promise.all(keys.map(async prefix => {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (attempt > 1) await wait(1100)
+      try {
+        await nfd.delete(prefix + uid)
+        return true
+      } catch (error) {
+        if (attempt === 3) console.error(`access revocation failed for ${prefix}${uid}: ${error}`)
+      }
+    }
+    return false
+  }))
+  return results.every(Boolean)
 }
 
 async function handleAdminMessage (message) {
@@ -205,74 +232,6 @@ function getMessageText (message) {
   return typeof message.text === 'string'
     ? message.text
     : typeof message.caption === 'string' ? message.caption : ''
-}
-
-function getMessageEntities (message) {
-  return [
-    ...(Array.isArray(message.entities) ? message.entities : []),
-    ...(Array.isArray(message.caption_entities) ? message.caption_entities : [])
-  ]
-}
-
-function hasExternalInlineButton (message) {
-  const rows = message.reply_markup?.inline_keyboard
-  if (!Array.isArray(rows)) return false
-  return rows.some(row => Array.isArray(row) && row.some(button =>
-    typeof button?.url === 'string' || button?.login_url || button?.web_app
-  ))
-}
-
-function getMessageRiskScore (message) {
-  const text = getMessageText(message).normalize('NFKC').toLowerCase()
-  const entityTypes = new Set(getMessageEntities(message).map(entity => entity.type))
-  let score = 0
-
-  const hasLink = entityTypes.has('url') || entityTypes.has('text_link') ||
-    /(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/|\b[a-z0-9-]+\.(?:com|net|org|xyz|top|vip|cc|me|io|app|shop)\b)/i.test(text)
-  if (hasLink) score += 3
-
-  const hasContact = entityTypes.has('mention') || entityTypes.has('text_mention') ||
-    entityTypes.has('phone_number') || entityTypes.has('email') ||
-    /@[a-z0-9_]{5,}/i.test(text) || /(?:^|\D)\+?\d[\d\s-]{6,}\d(?:\D|$)/.test(text)
-  if (hasContact) score += 3
-
-  if (
-    HIGH_RISK_AD_TERMS.some(term => text.includes(term)) ||
-    HIGH_RISK_AD_PATTERNS.some(pattern => pattern.test(text))
-  ) score += 3
-
-  const matchedTerms = AD_TERMS.filter(term => text.includes(term)).length
-  if (matchedTerms >= 2) score += 3
-  else if (matchedTerms === 1) score += 1
-
-  const hasMedia = Boolean(message.photo || message.video || message.animation || message.document)
-  const isForwarded = Boolean(message.forward_origin || message.forward_from || message.forward_from_chat)
-  if (hasMedia) score += 1
-  // Unknown users can forward an entire ad as several harmless-looking text
-  // messages, so every forwarded message must reach the challenge threshold.
-  if (isForwarded) score += 3
-  if (message.via_bot) score += 3
-  if (hasExternalInlineButton(message)) score += 3
-  if ((text.match(/\n/g) || []).length >= 4 || /(.)\1{7,}/u.test(text)) score += 1
-
-  return score
-}
-
-async function getUntrustedBurstRisk (uid) {
-  const key = 'untrusted-window-' + uid
-  const now = Date.now()
-  const state = await nfd.get(key, { type: 'json' })
-  if (state?.startedAt && now - state.startedAt <= UNTRUSTED_BURST_SECONDS * 1000) return 2
-  try {
-    await nfd.put(key, JSON.stringify({ startedAt: now }), {
-      expirationTtl: UNTRUSTED_BURST_SECONDS * 2
-    })
-  } catch (error) {
-    // This is an additional best-effort signal. A failure must not block a
-    // legitimate first contact; the content score still applies normally.
-    console.error(`untrusted burst state write failed for UID ${uid}: ${error}`)
-  }
-  return 0
 }
 
 function normalizeMessageForFingerprint (message) {
@@ -357,6 +316,22 @@ function remainingTtl (expiresAt) {
   return seconds > 0 ? Math.max(60, seconds) : 0
 }
 
+async function storeExpiringState (key, state) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (attempt > 1) await wait(1100)
+    const ttl = remainingTtl(state.expiresAt)
+    if (ttl <= 0) return false
+    state.writtenAt = Date.now()
+    try {
+      await nfd.put(key, JSON.stringify(state), { expirationTtl: ttl })
+      return true
+    } catch (error) {
+      if (attempt === 3) console.error(`state write failed for ${key}: ${error}`)
+    }
+  }
+  return false
+}
+
 async function savePendingMessage (message, expiresAt = null) {
   const uid = message.from.id.toString()
   const previous = pendingSaveQueues.get(uid) || Promise.resolve()
@@ -373,8 +348,8 @@ async function savePendingMessage (message, expiresAt = null) {
       writtenAt: now,
       expiresAt: expiresAt || now + CAPTCHA_TTL_SECONDS * 1000
     }
-    const ttl = remainingTtl(pending.expiresAt)
-    if (ttl > 0) await nfd.put(key, JSON.stringify(pending), { expirationTtl: ttl })
+    // A recent /unblock may have deleted this key less than a second ago.
+    if (!await storeExpiringState(key, pending)) throw new Error(`pending message write failed for UID ${uid}`)
     return pending
   })
   pendingSaveQueues.set(uid, current)
@@ -444,11 +419,7 @@ async function sendAndStoreCaptcha (key, challenge) {
     return false
   }
   challenge.messageId = response.result.message_id
-  challenge.writtenAt = Date.now()
-  try {
-    await nfd.put(key, JSON.stringify(challenge), { expirationTtl: ttl })
-  } catch (error) {
-    console.error(`captcha state write failed for UID ${challenge.userId}, message ${challenge.messageId}: ${error}`)
+  if (!await storeExpiringState(key, challenge)) {
     try {
       const deleted = await deleteMessage({ chat_id: challenge.chatId, message_id: challenge.messageId })
       if (deleted?.ok !== true) {
@@ -570,13 +541,31 @@ async function onCallbackQuery (query) {
       return
     }
 
+    // A visitor may have been blocked while answering the challenge.
+    if (await nfd.get('isblocked-' + uid, { type: 'json' })) return
+    if (await isTemporarilyRestricted(uid)) return
+    if (!await saveVerificationSession(uid)) {
+      await markStateCompleted(stateKey, state, `captcha state for UID ${uid}`)
+      await sendMessage({
+        chat_id: state.chatId,
+        text: '验证结果保存失败，原消息尚未发送。请重新发送一条消息以再次验证。'
+      })
+      return
+    }
+    if (await nfd.get('isblocked-' + uid, { type: 'json' })) {
+      await revokeVisitorAccess(uid)
+      return
+    }
+    if (await isTemporarilyRestricted(uid)) return
+
     const pendingKey = 'pending-message-' + uid
     const pending = await nfd.get(pendingKey, { type: 'json' })
-    let resultText = '✅ 验证成功，请发送您的问题。'
-    if (pending) {
+    let resultText = '✅ 验证成功，24 小时内可直接发送消息。请发送您的问题。'
+    if (pending && pending.status !== 'completed' && pending.expiresAt > Date.now() &&
+      pending.chatId?.toString() === uid && Number.isInteger(pending.messageId)) {
       const forwardResult = await forwardGuestMessage(pending.chatId, pending.messageId)
       if (forwardResult.forwarded) {
-        resultText = '✅ 验证成功，您的消息已发送，请耐心等待回复。'
+        resultText = '✅ 验证成功，您的消息已发送，24 小时内可继续发送消息。验证期间的其他消息请重新发送。'
       } else {
         resultText = '✅ 验证成功，但原消息发送失败，请重新发送一次。'
       }
@@ -703,19 +692,21 @@ async function handleBlock (message) {
     }), { expirationTtl: SPAM_FINGERPRINT_TTL_SECONDS }))
   }
   await Promise.all(writes)
-  await Promise.allSettled([
-    nfd.delete('trusted-' + guestChatId),
-    nfd.delete('verified-' + guestChatId)
-  ])
+  const revoked = await revokeVisitorAccess(guestChatId)
   return sendMessage({
     chat_id: ADMIN_UID,
-    text: `UID:${guestChatId}屏蔽成功${fingerprint ? '，已记录广告特征' : ''}`
+    text: `UID:${guestChatId}屏蔽成功${fingerprint ? '，已记录广告特征' : ''}${revoked ? '' : '；资格清理失败，解除屏蔽前将重试清理'}`
   })
 }
 
 async function handleUnBlock (message) {
   const guestChatId = await nfd.get('msg-map-' + message.reply_to_message.message_id, { type: 'json' })
   if (!guestChatId) return sendMessage({ chat_id: ADMIN_UID, text: '找不到该消息对应的用户，无法解除屏蔽。' })
+  // Never restore a verification grant or trust record left behind by a failed
+  // revocation. A newly unblocked visitor must verify again.
+  if (!await revokeVisitorAccess(guestChatId)) {
+    return sendMessage({ chat_id: ADMIN_UID, text: '信任或验证状态清理失败，未解除屏蔽，请稍后重试。' })
+  }
   await nfd.put('isblocked-' + guestChatId, 'false')
   const fingerprint = await getMessageFingerprint(message.reply_to_message)
   if (fingerprint) await nfd.delete('spam-fingerprint-' + fingerprint)
