@@ -5,26 +5,209 @@ const ADMIN_UID = ENV_ADMIN_UID.toString() // your user id, get it from https://
 
 const CAPTCHA_TTL_SECONDS = 10 * 60
 const CAPTCHA_PROCESSING_TIMEOUT_MS = 30 * 1000
-const CAPTCHA_VERSION = 3
-const VERIFIED_VERSION = 4
+const CAPTCHA_VERSION = 4
+const CAPTCHA_MAX_FAILURES = 2
+const CAPTCHA_BLOCK_SECONDS = 60 * 60
+const VERIFIED_VERSION = 5
 const VERIFIED_TTL_SECONDS = 24 * 60 * 60
 const SPAM_FINGERPRINT_TTL_SECONDS = 30 * 24 * 60 * 60
 const RATE_BLOCK_SECONDS = 24 * 60 * 60
 const DELIVERY_AUDIT_TTL_SECONDS = 30 * 24 * 60 * 60
-const TURNSTILE_ACTION = 'nfd_verify'
-const INIT_DATA_MAX_AGE_SECONDS = 10 * 60
-const VERIFY_BODY_MAX_BYTES = 16384
-const CHALLENGE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-const TURNSTILE_SITE_KEY = typeof ENV_TURNSTILE_SITE_KEY === 'string' ? ENV_TURNSTILE_SITE_KEY.trim() : ''
-const TURNSTILE_SECRET_KEY = typeof ENV_TURNSTILE_SECRET_KEY === 'string' ? ENV_TURNSTILE_SECRET_KEY.trim() : ''
-const PUBLIC_URL = typeof ENV_PUBLIC_URL === 'string' ? ENV_PUBLIC_URL.trim() : ''
+const CAPTCHA_PROMPT_TTL_SECONDS = 30 * 24 * 60 * 60
+const CAPTCHA_ANSWER_TTL_SECONDS = 24 * 60 * 60
 const fraudDb = 'https://raw.githubusercontent.com/LloydAsp/nfd/main/data/fraud.db'
 const startMsgUrl = 'https://raw.githubusercontent.com/besnow/nfd/main/data/startMessage.v4.md'
 const adminMsgUrl = 'https://raw.githubusercontent.com/besnow/nfd/main/data/adminMessage.v4.md'
 
 const pendingSaveQueues = new Map()
 const captchaCreationQueues = new Map()
-const verificationQueues = new Map()
+const captchaAnswerQueues = new Map()
+
+// Self-contained PNG renderer for Workers. The answer is drawn into pixels only;
+// no answer, text chunk, font dependency, or external rendering service is used.
+const CAPTCHA_PNG_DIGITS = {
+  '2': [0b0111110, 0b1100011, 0b0000011, 0b0000011, 0b0000110, 0b0001100, 0b0011000, 0b0110000, 0b1100000, 0b1111111],
+  '3': [0b0111110, 0b1100011, 0b0000011, 0b0000011, 0b0011110, 0b0000011, 0b0000011, 0b0000011, 0b1100011, 0b0111110],
+  '4': [0b0001100, 0b0011100, 0b0111100, 0b1101100, 0b1101100, 0b1101100, 0b1111111, 0b0001100, 0b0001100, 0b0001100],
+  '5': [0b1111111, 0b1100000, 0b1100000, 0b1100000, 0b1111110, 0b0000011, 0b0000011, 0b0000011, 0b1100011, 0b0111110],
+  '6': [0b0011110, 0b0110000, 0b1100000, 0b1100000, 0b1111110, 0b1100011, 0b1100011, 0b1100011, 0b1100011, 0b0111110],
+  '7': [0b1111111, 0b0000011, 0b0000011, 0b0000110, 0b0001100, 0b0011000, 0b0011000, 0b0011000, 0b0011000, 0b0011000],
+  '8': [0b0111110, 0b1100011, 0b1100011, 0b1100011, 0b0111110, 0b1100011, 0b1100011, 0b1100011, 0b1100011, 0b0111110],
+  '9': [0b0111110, 0b1100011, 0b1100011, 0b1100011, 0b1100011, 0b0111111, 0b0000011, 0b0000011, 0b0000110, 0b0111100]
+}
+
+const CAPTCHA_PNG_CRC_TABLE = (() => {
+  const table = new Uint32Array(256)
+  for (let n = 0; n < table.length; n++) {
+    let value = n
+    for (let bit = 0; bit < 8; bit++) {
+      value = (value & 1) ? 0xEDB88320 ^ (value >>> 1) : value >>> 1
+    }
+    table[n] = value >>> 0
+  }
+  return table
+})()
+
+function captchaPngWriteUint32 (bytes, offset, value) {
+  bytes[offset] = value >>> 24
+  bytes[offset + 1] = value >>> 16
+  bytes[offset + 2] = value >>> 8
+  bytes[offset + 3] = value
+}
+
+function captchaPngChunk (type, data) {
+  const chunk = new Uint8Array(data.length + 12)
+  captchaPngWriteUint32(chunk, 0, data.length)
+  for (let i = 0; i < 4; i++) chunk[4 + i] = type.charCodeAt(i)
+  chunk.set(data, 8)
+  let crc = 0xFFFFFFFF
+  for (let i = 4; i < chunk.length - 4; i++) {
+    crc = CAPTCHA_PNG_CRC_TABLE[(crc ^ chunk[i]) & 0xFF] ^ (crc >>> 8)
+  }
+  captchaPngWriteUint32(chunk, chunk.length - 4, (crc ^ 0xFFFFFFFF) >>> 0)
+  return chunk
+}
+
+function captchaPngDeflateStored (raw) {
+  // RFC 1950 zlib header and RFC 1951 byte-aligned, uncompressed DEFLATE
+  // blocks. Each block is bounded by the 16-bit LEN field.
+  const count = Math.max(1, Math.ceil(raw.length / 65535))
+  const packed = new Uint8Array(2 + raw.length + count * 5 + 4)
+  packed[0] = 0x78
+  packed[1] = 0x01
+  let offset = 2
+  let cursor = 0
+  for (let block = 0; block < count; block++) {
+    const length = Math.min(65535, raw.length - cursor)
+    const inverse = (~length) & 0xFFFF
+    packed[offset++] = block === count - 1 ? 1 : 0
+    packed[offset++] = length & 0xFF
+    packed[offset++] = length >>> 8
+    packed[offset++] = inverse & 0xFF
+    packed[offset++] = inverse >>> 8
+    packed.set(raw.subarray(cursor, cursor + length), offset)
+    offset += length
+    cursor += length
+  }
+  let a = 1
+  let b = 0
+  // Bounded batches keep the Adler sums within exact integer range.
+  for (let start = 0; start < raw.length; start += 5552) {
+    const end = Math.min(raw.length, start + 5552)
+    for (let i = start; i < end; i++) {
+      a += raw[i]
+      b += a
+    }
+    a %= 65521
+    b %= 65521
+  }
+  captchaPngWriteUint32(packed, offset, ((b << 16) | a) >>> 0)
+  return packed
+}
+
+function renderCaptchaPng (answer) {
+  if (typeof answer !== 'string' || !/^[2-9]{5}$/.test(answer)) {
+    throw new Error('Invalid captcha image input')
+  }
+  const width = 240
+  const height = 90
+  const pixels = new Uint8Array(width * height)
+  pixels.fill(250)
+  const randomValues = new Uint32Array(256)
+  let randomIndex = randomValues.length
+  function random () {
+    if (randomIndex === randomValues.length) {
+      crypto.getRandomValues(randomValues)
+      randomIndex = 0
+    }
+    return randomValues[randomIndex++] / 4294967296
+  }
+  function blend (x, y, shade, alpha) {
+    if (x < 0 || x >= width || y < 0 || y >= height) return
+    const offset = y * width + x
+    pixels[offset] = Math.round(pixels[offset] * (1 - alpha) + shade * alpha)
+  }
+  function noiseLine (shade, opacity) {
+    const y0 = 12 + random() * 66
+    const slope = (random() - 0.5) * 0.13
+    const phase = random() * Math.PI * 2
+    const amplitude = 3 + random() * 5
+    const frequency = 0.012 + random() * 0.012
+    for (let x = 4; x < width - 4; x++) {
+      const y = y0 + slope * (x - width / 2) + amplitude * Math.sin(x * frequency + phase)
+      const row = Math.floor(y)
+      const fraction = y - row
+      blend(x, row, shade, opacity * (1 - fraction))
+      blend(x, row + 1, shade, opacity * fraction)
+    }
+  }
+
+  // Restrained, low-contrast noise preserves readability on small phone screens.
+  for (let i = 0; i < 3; i++) noiseLine(196, 0.65)
+  for (let i = 0; i < 50; i++) {
+    const x = 5 + Math.floor(random() * 230)
+    const y = 5 + Math.floor(random() * 80)
+    blend(x, y, 152, 0.4)
+    if (random() > 0.5) blend(x + 1, y, 152, 0.25)
+  }
+
+  for (let index = 0; index < answer.length; index++) {
+    const rows = CAPTCHA_PNG_DIGITS[answer[index]]
+    const scaleX = 4.0 + random() * 0.4
+    const scaleY = 4.5 + random() * 0.5
+    const centerX = 34 + index * 43 + (random() - 0.5) * 4
+    const centerY = 45 + (random() - 0.5) * 6
+    const angle = (random() - 0.5) * 0.18
+    const cosine = Math.cos(angle)
+    const sine = Math.sin(angle)
+    const shade = 32 + Math.floor(random() * 32)
+    const x0 = Math.max(0, Math.floor(centerX - 21))
+    const x1 = Math.min(width - 1, Math.ceil(centerX + 21))
+    const y0 = Math.max(0, Math.floor(centerY - 29))
+    const y1 = Math.min(height - 1, Math.ceil(centerY + 29))
+    const inverseX = 1 / scaleX
+    const inverseY = 1 / scaleY
+    for (let y = y0; y <= y1; y++) {
+      const dy = y + 0.5 - centerY
+      const sineY = sine * dy
+      const cosineY = cosine * dy
+      for (let x = x0; x <= x1; x++) {
+        const dx = x + 0.5 - centerX
+        const column = (cosine * dx + sineY) * inverseX + 3.5
+        const row = (-sine * dx + cosineY) * inverseY + 5
+        // Coordinates are nonnegative after the bounds checks, so truncation
+        // is equivalent to floor without a function call for every pixel.
+        if (row >= 0 && row < 10 && column >= 0 && column < 7 &&
+          (rows[row | 0] & (1 << (6 - (column | 0)))) !== 0) {
+          pixels[y * width + x] = shade
+        }
+      }
+    }
+  }
+  noiseLine(150, 0.35)
+
+  const stride = width + 1
+  const raw = new Uint8Array(stride * height)
+  for (let y = 0; y < height; y++) {
+    // Every row begins with the PNG filter byte 0 (None).
+    raw.set(pixels.subarray(y * width, (y + 1) * width), y * stride + 1)
+  }
+  const header = new Uint8Array(13)
+  captchaPngWriteUint32(header, 0, width)
+  captchaPngWriteUint32(header, 4, height)
+  header[8] = 8 // Eight bits per sample.
+  header[9] = 0 // Grayscale, without alpha or interlacing.
+  const ihdr = captchaPngChunk('IHDR', header)
+  const idat = captchaPngChunk('IDAT', captchaPngDeflateStored(raw))
+  const iend = captchaPngChunk('IEND', new Uint8Array(0))
+  const png = new Uint8Array(8 + ihdr.length + idat.length + iend.length)
+  png.set([137, 80, 78, 71, 13, 10, 26, 10])
+  png.set(ihdr, 8)
+  png.set(idat, 8 + ihdr.length)
+  png.set(iend, 8 + ihdr.length + idat.length)
+  return png
+}
+
 
 function apiUrl (methodName, params = null) {
   let query = ''
@@ -68,11 +251,7 @@ function deleteMessage (msg) {
 
 addEventListener('fetch', event => {
   const url = new URL(event.request.url)
-  if (url.pathname === '/verify') {
-    event.respondWith(handleVerifyPage(event.request))
-  } else if (url.pathname === '/verify/complete') {
-    event.respondWith(handleVerifyComplete(event.request))
-  } else if (url.pathname === WEBHOOK) {
+  if (url.pathname === WEBHOOK) {
     event.respondWith(handleWebhook(event))
   } else if (url.pathname === '/registerWebhook') {
     event.respondWith(registerWebhook(event, url, WEBHOOK, SECRET))
@@ -114,6 +293,10 @@ async function onMessage (message) {
     return sendMessage({ chat_id: message.chat.id, text: startMsg })
   }
 
+  // Replies to captcha images are control messages, even after verification
+  // or permanent trust. Never deliver a consumed answer to the administrator.
+  if (await handleCaptchaAnswer(message)) return
+
   const trust = await nfd.get('trusted-' + uid, { type: 'json' })
   if (trust) {
     return handleGuestMessage(message, {
@@ -137,7 +320,7 @@ async function onMessage (message) {
 
 async function getVerifiedSession (uid) {
   const state = await nfd.get('verified-' + uid, { type: 'json' })
-  return state?.version === VERIFIED_VERSION && state.method === 'turnstile' &&
+  return state?.version === VERIFIED_VERSION && state.method === 'image' &&
     Number.isFinite(state.expiresAt) && state.expiresAt > Date.now() ? state : null
 }
 
@@ -159,7 +342,7 @@ async function saveVerificationSession (uid, challengeId) {
   const verifiedAt = Date.now()
   const state = {
     version: VERIFIED_VERSION,
-    method: 'turnstile',
+    method: 'image',
     challengeId,
     verifiedAt,
     expiresAt: verifiedAt + VERIFIED_TTL_SECONDS * 1000
@@ -291,30 +474,26 @@ async function silentlyBlockKnownSpam (uid) {
   }
 }
 
-function getVerificationConfig () {
-  if (!TURNSTILE_SITE_KEY || !TURNSTILE_SECRET_KEY || !PUBLIC_URL) return null
-  try {
-    const url = new URL(PUBLIC_URL)
-    if (url.protocol !== 'https:' || url.username || url.password ||
-      url.pathname !== '/' || url.search || url.hash) return null
-    return {
-      siteKey: TURNSTILE_SITE_KEY,
-      secretKey: TURNSTILE_SECRET_KEY,
-      origin: url.origin,
-      hostname: url.hostname
-    }
-  } catch (_) {
-    return null
-  }
+async function hashCaptchaAnswer (uid, challengeId, answer) {
+  const digest = await crypto.subtle.digest(
+    'SHA-256', new TextEncoder().encode(`nfd:image:${uid}:${challengeId}:${answer}`)
+  )
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('')
 }
 
-function createCaptcha (userId, chatId, messageId = null, expiresAt = null, pending = null) {
+async function createCaptcha (userId, chatId, messageId = null, expiresAt = null, pending = null, failures = 0) {
   const now = Date.now()
-  return {
-    id: crypto.randomUUID(),
-    userId: userId.toString(),
+  const uid = userId.toString()
+  const id = crypto.randomUUID()
+  const random = crypto.getRandomValues(new Uint8Array(5))
+  const answer = Array.from(random, byte => (2 + (byte & 7)).toString()).join('')
+  const state = {
+    id,
+    userId: uid,
     version: CAPTCHA_VERSION,
-    method: 'turnstile',
+    method: 'image',
+    answerHash: await hashCaptchaAnswer(uid, id, answer),
+    failures,
     pendingChatId: pending?.chatId ?? null,
     pendingMessageId: pending?.messageId ?? null,
     pendingExpiresAt: pending?.expiresAt ?? null,
@@ -325,16 +504,25 @@ function createCaptcha (userId, chatId, messageId = null, expiresAt = null, pend
     chatId,
     messageId
   }
+  // The plaintext exists only while creating the pixels. It is never part of
+  // persisted state, a caption, a filename, a callback, a URL, or a log entry.
+  return { state, image: renderCaptchaPng(answer) }
 }
 
 function captchaText () {
-  return '为防止自动广告，请点击下方按钮完成安全验证。验证通过后，首条消息会自动发送；等待期间的其他消息请在通过后重新发送。'
+  return '请回复这张图片，输入图片中的 5 位数字。验证会话最多 10 分钟，换图不延长；累计输错 2 次将限制 1 小时。验证通过后首条消息自动发送，等待期间的其他消息请重新发送。'
 }
 
-function captchaKeyboard (challenge, config) {
-  const url = new URL('/verify', config.origin)
-  url.searchParams.set('challenge', challenge.id)
-  return { inline_keyboard: [[{ text: '开始安全验证', web_app: { url: url.toString() } }]] }
+function sendCaptchaPhoto (chatId, image) {
+  const form = new FormData()
+  form.append('chat_id', chatId.toString())
+  form.append('photo', new Blob([image], { type: 'image/png' }), 'captcha.png')
+  form.append('caption', captchaText())
+  form.append('reply_markup', JSON.stringify({
+    force_reply: true,
+    input_field_placeholder: '回复图片并输入 5 位数字'
+  }))
+  return requestTelegram('sendPhoto', { method: 'POST', body: form })
 }
 
 function remainingTtl (expiresAt) {
@@ -413,6 +601,8 @@ async function markStateCompleted (key, state, label) {
     messageId: state.messageId,
     createdAt: state.createdAt,
     method: state.method,
+    failures: state.failures,
+    blockedUntil: state.blockedUntil,
     pendingChatId: state.pendingChatId,
     pendingMessageId: state.pendingMessageId,
     pendingExpiresAt: state.pendingExpiresAt,
@@ -433,9 +623,10 @@ async function markStateCompleted (key, state, label) {
       // State can expire, be revoked, or be replaced during a retry. Never
       // resurrect old records or complete a different pending message.
       if (!sameGeneration) return false
-      if (current.status === 'completed') return true
+      if (current.status === 'completed' && (current.failures || 0) >= (completed.failures || 0) &&
+        (current.blockedUntil || 0) >= (completed.blockedUntil || 0)) return true
       await nfd.put(key, JSON.stringify(completed), {
-        expirationTtl: remainingTtl(state.expiresAt) || 60
+        expirationTtl: remainingTtl(Math.max(state.expiresAt || 0, state.blockedUntil || 0)) || 60
       })
       return true
     } catch (error) {
@@ -445,65 +636,99 @@ async function markStateCompleted (key, state, label) {
   return false
 }
 
-async function sendAndStoreCaptcha (key, challenge) {
-  const config = getVerificationConfig()
-  if (!config || remainingTtl(challenge.expiresAt) <= 0) return false
-  const response = await sendMessage({
-    chat_id: challenge.chatId,
-    text: captchaText(challenge),
-    reply_markup: captchaKeyboard(challenge, config)
-  })
-  if (response?.ok !== true || !response.result?.message_id) return false
-  const ttl = remainingTtl(challenge.expiresAt)
-  if (ttl <= 0) {
-    await deleteMessage({ chat_id: challenge.chatId, message_id: response.result.message_id })
+async function sendAndStoreCaptcha (key, challenge, image) {
+  if (remainingTtl(challenge.expiresAt) <= 0) return false
+  let response
+  try {
+    response = await sendCaptchaPhoto(challenge.chatId, image)
+  } catch (_) {
+    console.error(`captcha photo send failed for UID ${challenge.userId}`)
     return false
   }
+  if (response?.ok !== true || !Number.isInteger(response.result?.message_id)) return false
   challenge.messageId = response.result.message_id
-  if (!await storeExpiringState(key, challenge)) {
-    try {
-      const deleted = await deleteMessage({ chat_id: challenge.chatId, message_id: challenge.messageId })
-      if (deleted?.ok !== true) {
-        console.error(`captcha cleanup delete failed for UID ${challenge.userId}, message ${challenge.messageId}`)
-      }
-    } catch (deleteError) {
-      console.error(`captcha cleanup delete failed for UID ${challenge.userId}, message ${challenge.messageId}: ${deleteError}`)
-    }
-    return false
+  const promptSaved = await saveDeliveryRecord(
+    `captcha-prompt-${challenge.userId}-${challenge.messageId}`,
+    JSON.stringify({ version: 1, uid: challenge.userId, challengeId: challenge.id, createdAt: Date.now() }),
+    { expirationTtl: CAPTCHA_PROMPT_TTL_SECONDS }, 'captcha prompt marker'
+  )
+  if (promptSaved && await storeExpiringState(key, challenge)) return true
+  // A prompt without durable identity/state cannot be used. Cleanup only;
+  // successful/consumed prompts are retained so late replies keep their context.
+  try {
+    await deleteMessage({ chat_id: challenge.chatId, message_id: challenge.messageId })
+  } catch (_) {
+    console.error(`captcha photo cleanup failed for UID ${challenge.userId}`)
   }
-  return true
+  return false
 }
 
-async function writeCaptchaClaim (state, uid, claimedAt) {
-  const key = 'captcha-claim-' + state.id
-  const value = JSON.stringify({ userId: uid, claimedAt })
+async function getCaptchaAttempt (uid, challengeId = null) {
+  const attempt = await nfd.get('captcha-attempt-' + uid, { type: 'json' })
+  if (!attempt || (challengeId && attempt.challengeId !== challengeId)) return null
+  return attempt
+}
+
+async function writeCaptchaClaim (state, uid, claimedAt, outcome = {}) {
+  const key = 'captcha-attempt-' + uid
+  const value = JSON.stringify({
+    userId: uid, challengeId: state.id, claimedAt, expiresAt: state.expiresAt,
+    failures: outcome.failures ?? state.failures ?? 0,
+    outcome: outcome.outcome || 'pending',
+    answerMessageId: outcome.answerMessageId || null,
+    blockedUntil: outcome.blockedUntil || null
+  })
   for (let attempt = 1; attempt <= 3; attempt++) {
     if (attempt > 1) await wait(1100)
     try {
-      await nfd.put(key, value, { expirationTtl: remainingTtl(state.expiresAt) || 60 })
+      const previous = await getCaptchaAttempt(uid)
+      // Re-read before each retry: do not overwrite a consumed generation or
+      // shorten a restriction another invocation has already persisted.
+      if (previous?.challengeId === state.id || previous?.blockedUntil > Date.now()) return false
+      await nfd.put(key, value, {
+        expirationTtl: remainingTtl(Math.max(state.expiresAt, outcome.blockedUntil || 0)) || 60
+      })
       return true
-    } catch (error) {
-      if (attempt === 3) {
-        console.error(`captcha claim write failed after 3 attempts for UID ${uid}, challenge ${state.id}: ${error}`)
-      }
+    } catch (_) {
+      if (attempt === 3) console.error(`captcha claim write failed for UID ${uid}`)
     }
   }
   return false
 }
 
+async function restrictCaptchaSession (uid, state) {
+  const blockedUntil = state.blockedUntil || Date.now() + CAPTCHA_BLOCK_SECONDS * 1000
+  const terminal = { ...state, failures: CAPTCHA_MAX_FAILURES, blockedUntil }
+  // Keep both the explicit block and the completed session as independent
+  // evidence. A failed block write must not reset a consumed two-error session.
+  const [blocked, completed] = await Promise.all([
+    saveDeliveryRecord('captcha-block-' + uid, JSON.stringify({ blockedUntil }), {
+      expirationTtl: remainingTtl(blockedUntil) || 60
+    }, 'captcha restriction'),
+    markStateCompleted('captcha-' + uid, terminal, `captcha restriction for UID ${uid}`)
+  ])
+  return blocked || completed
+}
+
 async function ensureCaptcha (message, pending = null) {
   const uid = message.from.id.toString()
-  if (!getVerificationConfig()) {
-    await sendMessage({ chat_id: message.chat.id, text: '安全验证暂不可用，消息尚未发送，请稍后重试。' })
-    return
-  }
   const previous = captchaCreationQueues.get(uid) || Promise.resolve()
-  const current = previous.then(async () => {
+  const current = previous.catch(() => {}).then(async () => {
+    if (await isTemporarilyRestricted(uid)) return
     const key = 'captcha-' + uid
     const existing = await nfd.get(key, { type: 'json' })
     const now = Date.now()
-    if (existing?.version === CAPTCHA_VERSION && existing.method === 'turnstile' && existing.status === 'active' && existing.messageId && existing.expiresAt > now) {
-      const claim = await nfd.get('captcha-claim-' + existing.id, { type: 'json' })
+    const currentVersion = existing?.version === CAPTCHA_VERSION && existing.method === 'image'
+    const claim = currentVersion && existing.id
+      ? await getCaptchaAttempt(uid, existing.id) : null
+    const failures = currentVersion && existing.expiresAt > now
+      ? Math.max(existing.failures || 0, claim?.failures || 0) : 0
+    const blockedUntil = Math.max(existing?.blockedUntil || 0, claim?.blockedUntil || 0)
+    if (blockedUntil > now || failures >= CAPTCHA_MAX_FAILURES) {
+      await restrictCaptchaSession(uid, { ...existing, failures, blockedUntil: blockedUntil || now + CAPTCHA_BLOCK_SECONDS * 1000 })
+      return
+    }
+    if (currentVersion && existing.status === 'active' && existing.messageId && existing.expiresAt > now) {
       if (!claim || now - claim.claimedAt <= CAPTCHA_PROCESSING_TIMEOUT_MS) return
       await waitForCaptchaWrite(existing)
     } else if (existing?.status === 'completed') {
@@ -511,227 +736,125 @@ async function ensureCaptcha (message, pending = null) {
     }
 
     const currentPending = pending || await nfd.get('pending-message-' + uid, { type: 'json' })
-    const continuesActiveSession = existing?.status === 'active' && existing.expiresAt > now
-    const expiresAt = continuesActiveSession
+    const continuesSession = currentVersion && existing.expiresAt > now
+    const expiresAt = continuesSession
       ? existing.expiresAt
       : currentPending?.expiresAt > now ? currentPending.expiresAt : now + CAPTCHA_TTL_SECONDS * 1000
-    const challenge = createCaptcha(uid, message.chat.id, null, expiresAt, currentPending)
-    await sendAndStoreCaptcha(key, challenge)
+    const challenge = await createCaptcha(uid, message.chat.id, null, expiresAt, currentPending, failures)
+    if (!await sendAndStoreCaptcha(key, challenge.state, challenge.image)) {
+      await sendMessage({ chat_id: message.chat.id, text: '验证码图片暂时无法发送，原消息尚未发送，请稍后重试。' })
+    }
   })
   captchaCreationQueues.set(uid, current)
   try {
-    await current
+    return await current
   } finally {
     if (captchaCreationQueues.get(uid) === current) captchaCreationQueues.delete(uid)
   }
 }
 
-function verifyResponse (status, body, extraHeaders = {}) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': 'no-store',
-      'Referrer-Policy': 'no-referrer',
-      'X-Content-Type-Options': 'nosniff',
-      ...extraHeaders
-    }
-  })
-}
-
-function isVerificationOrigin (request, config) {
-  try {
-    return new URL(request.url).origin === config.origin &&
-      (!request.headers.get('Origin') || request.headers.get('Origin') === config.origin)
-  } catch (_) {
-    return false
-  }
-}
-
-async function hmacSha256 (key, value) {
-  const encoder = new TextEncoder()
-  const imported = await crypto.subtle.importKey(
-    'raw', typeof key === 'string' ? encoder.encode(key) : key,
-    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-  )
-  return new Uint8Array(await crypto.subtle.sign('HMAC', imported, encoder.encode(value)))
-}
-
-async function validateTelegramInitData (raw) {
-  if (typeof raw !== 'string' || !raw || raw.length > 8192) return null
-  try {
-    const params = new URLSearchParams(raw)
-    const seen = new Set()
-    const fields = []
-    for (const [key, value] of params) {
-      if (seen.has(key)) return null
-      seen.add(key)
-      if (key !== 'hash') fields.push([key, value])
-    }
-    const hash = params.get('hash')
-    if (!hash || !/^[a-f0-9]{64}$/i.test(hash)) return null
-    fields.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
-    // HMAC validation excludes hash only. Telegram's optional signature remains
-    // part of this string (the Ed25519 validation rules are different).
-    const dataCheckString = fields.map(([key, value]) => `${key}=${value}`).join('\n')
-    const secretKey = await hmacSha256('WebAppData', TOKEN)
-    const expected = await hmacSha256(secretKey, dataCheckString)
-    const supplied = new Uint8Array(hash.match(/../g).map(byte => parseInt(byte, 16)))
-    let difference = 0
-    for (let index = 0; index < expected.length; index++) difference |= expected[index] ^ supplied[index]
-    if (difference !== 0) return null
-
-    const authDateRaw = params.get('auth_date')
-    if (!authDateRaw || !/^\d{1,12}$/.test(authDateRaw)) return null
-    const authDate = Number(authDateRaw)
-    const now = Math.floor(Date.now() / 1000)
-    if (!Number.isSafeInteger(authDate) || now - authDate > INIT_DATA_MAX_AGE_SECONDS || authDate - now > 30) return null
-    const user = JSON.parse(params.get('user'))
-    if (!user || typeof user !== 'object' || Array.isArray(user) ||
-      !Number.isSafeInteger(user.id) || user.id <= 0 || user.is_bot === true) return null
-    return { userId: user.id.toString(), authDate }
-  } catch (_) {
-    return null
-  }
-}
-
-async function readVerifyBody (request) {
-  if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get('Content-Type') || '')) throw new Error('invalid content type')
-  if (!request.body) throw new Error('missing body')
-  const reader = request.body.getReader()
-  const chunks = []
-  let length = 0
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      length += value.byteLength
-      if (length > VERIFY_BODY_MAX_BYTES) {
-        await reader.cancel()
-        throw new Error('body too large')
-      }
-      chunks.push(value)
-    }
-  } finally {
-    reader.releaseLock()
-  }
-  const bytes = new Uint8Array(length)
-  let offset = 0
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset)
-    offset += chunk.byteLength
-  }
-  const body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes))
-  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('invalid body')
-  return body
-}
-
-async function verifyTurnstileToken (token, challengeId, request, config = getVerificationConfig()) {
-  if (!config || typeof token !== 'string' || !token || token.length > 2048) return false
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 10000)
-  try {
-    const body = { secret: config.secretKey, response: token }
-    const ip = request.headers.get('CF-Connecting-IP')
-    if (ip) body.remoteip = ip
-    const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: controller.signal
-    })
-    if (!response.ok) return false
-    const result = await response.json()
-    return result?.success === true && result.hostname === config.hostname &&
-      result.action === TURNSTILE_ACTION && result.cdata === challengeId
-  } catch (_) {
-    // Never log the submitted token, signed Telegram data, or secret.
-    console.error('Turnstile verification request failed')
-    return false
-  } finally {
-    clearTimeout(timeout)
-  }
-}
-
-function isActiveChallenge (state, uid, challengeId) {
-  return state?.version === CAPTCHA_VERSION && state.method === 'turnstile' &&
+function isActiveChallenge (state, uid, challengeId = state?.id) {
+  return state?.version === CAPTCHA_VERSION && state.method === 'image' &&
     state.id === challengeId && state.userId?.toString() === uid &&
     state.chatId?.toString() === uid && state.status === 'active' &&
     Number.isInteger(state.messageId) && state.messageId > 0 &&
+    typeof state.answerHash === 'string' && /^[a-f0-9]{64}$/i.test(state.answerHash) &&
     Number.isFinite(state.expiresAt) && state.expiresAt > Date.now()
 }
 
-async function completeVerification (request, config, uid, body) {
-  if (uid === ADMIN_UID || await nfd.get('isblocked-' + uid, { type: 'json' }) || await isTemporarilyRestricted(uid)) {
-    return verifyResponse(403, { ok: false, error: 'blocked' })
+async function handleCaptchaAnswer (message) {
+  const uid = message.from.id.toString()
+  const answerKey = `captcha-answer-${uid}-${message.message_id}`
+  if (await nfd.get(answerKey, { type: 'json' })) return true
+  const replyId = message.reply_to_message?.message_id
+  if (!Number.isInteger(replyId)) return false
+  const state = await nfd.get('captcha-' + uid, { type: 'json' })
+  const currentPrompt = state?.messageId === replyId && state.userId?.toString() === uid && state.chatId?.toString() === uid
+  const prompt = currentPrompt || await nfd.get(`captcha-prompt-${uid}-${replyId}`, { type: 'json' })
+  if (!prompt) return false
+  const previous = captchaAnswerQueues.get(uid) || Promise.resolve()
+  const current = previous.catch(() => {}).then(() => processCaptchaAnswer(message))
+  captchaAnswerQueues.set(uid, current)
+  try {
+    await current
+  } catch (_) {
+    console.error(`captcha answer processing failed for UID ${uid}`)
+  } finally {
+    if (captchaAnswerQueues.get(uid) === current) captchaAnswerQueues.delete(uid)
   }
+  return true
+}
+
+async function processCaptchaAnswer (message) {
+  const uid = message.from.id.toString()
+  if (await nfd.get('isblocked-' + uid, { type: 'json' }) || await isTemporarilyRestricted(uid)) return
+  const answerKey = `captcha-answer-${uid}-${message.message_id}`
+  if (await nfd.get(answerKey, { type: 'json' })) return
   const stateKey = 'captcha-' + uid
   let state = await nfd.get(stateKey, { type: 'json' })
-  if (!isActiveChallenge(state, uid, body.challengeId)) return verifyResponse(409, { ok: false, error: 'invalid_challenge' })
-  if (await nfd.get('captcha-claim-' + state.id, { type: 'json' })) {
-    return verifyResponse(409, { ok: false, error: 'already_processing' })
+  if (!isActiveChallenge(state, uid) || state.messageId !== message.reply_to_message?.message_id) {
+    await sendMessage({ chat_id: message.chat.id, text: '这张验证码图片已处理或已失效，请勿重复作答；需要验证时请重新发送一条消息获取当前图片。' })
+    return
   }
-  if (!await verifyTurnstileToken(body.turnstileToken, state.id, request, config)) {
-    return verifyResponse(403, { ok: false, error: 'turnstile_failed' })
+  const answer = typeof message.text === 'string' ? message.text.trim() : ''
+  if (!/^[0-9]{5}$/.test(answer)) {
+    await sendMessage({ chat_id: message.chat.id, text: '请回复当前验证码图片，只输入图片中的 5 位数字。格式不正确不计入错误次数。' })
+    return
   }
-
-  // Siteverify may take time. Re-read identity-bound state and restrictions
-  // before claiming the attempt; never trust stale browser-supplied state.
-  state = await nfd.get(stateKey, { type: 'json' })
-  if (!isActiveChallenge(state, uid, body.challengeId)) return verifyResponse(409, { ok: false, error: 'invalid_challenge' })
-  if (await nfd.get('isblocked-' + uid, { type: 'json' }) || await isTemporarilyRestricted(uid)) {
-    return verifyResponse(403, { ok: false, error: 'blocked' })
+  if (await getCaptchaAttempt(uid, state.id)) return
+  const correct = await hashCaptchaAnswer(uid, state.id, answer) === state.answerHash
+  const failures = (state.failures || 0) + (correct ? 0 : 1)
+  const blockedUntil = failures >= CAPTCHA_MAX_FAILURES ? Date.now() + CAPTCHA_BLOCK_SECONDS * 1000 : null
+  if (!await saveDeliveryRecord(answerKey, JSON.stringify({
+    uid, challengeId: state.id, promptMessageId: state.messageId, receivedAt: Date.now()
+  }), { expirationTtl: CAPTCHA_ANSWER_TTL_SECONDS }, 'captcha answer marker')) {
+    await sendMessage({ chat_id: message.chat.id, text: '验证暂时无法处理，请稍后重新回复当前图片。' })
+    return
   }
-  if (await nfd.get('captcha-claim-' + state.id, { type: 'json' })) {
-    return verifyResponse(409, { ok: false, error: 'already_processing' })
+  // This lease records the outcome before replacing a wrong image, so retries
+  // inherit the same session deadline and failure count. KV is not a global CAS.
+  if (!await writeCaptchaClaim(state, uid, Date.now(), {
+    outcome: correct ? 'correct' : 'wrong', failures, blockedUntil, answerMessageId: message.message_id
+  })) {
+    await sendMessage({ chat_id: message.chat.id, text: '验证暂时无法处理，请稍后重新回复当前图片。' })
+    return
   }
-  // Persist a recovery lease before consuming the Telegram button. A failed
-  // claim leaves the button usable; an abandoned lease can be renewed by
-  // ensureCaptcha after 30 seconds. KV/deleteMessage are best-effort deduplication,
-  // not a cross-instance atomic transaction.
-  if (!await writeCaptchaClaim(state, uid, Date.now())) {
-    return verifyResponse(503, { ok: false, error: 'verification_unavailable' })
+  const currentState = await nfd.get(stateKey, { type: 'json' })
+  if (await nfd.get('isblocked-' + uid, { type: 'json' })) return
+  // An accepted second error remains a one-hour restriction even if its
+  // original ten-minute challenge expires while the durable receipt is saved.
+  if (!correct && failures >= CAPTCHA_MAX_FAILURES) {
+    await restrictCaptchaSession(uid, { ...state, failures, blockedUntil })
+    await sendMessage({ chat_id: message.chat.id, text: '验证错误次数过多，请 1 小时后再试。' })
+    return
   }
-  if (!isActiveChallenge(await nfd.get(stateKey, { type: 'json' }), uid, state.id)) {
-    return verifyResponse(409, { ok: false, error: 'invalid_challenge' })
-  }
-  if (await nfd.get('isblocked-' + uid, { type: 'json' }) || await isTemporarilyRestricted(uid)) {
-    return verifyResponse(403, { ok: false, error: 'blocked' })
-  }
-  let deleted
-  try {
-    deleted = await deleteMessage({ chat_id: state.chatId, message_id: state.messageId })
-  } catch (_) {
-    return verifyResponse(503, { ok: false, error: 'verification_unavailable' })
-  }
-  if (deleted?.ok !== true) return verifyResponse(409, { ok: false, error: 'already_processing' })
-  if (!isActiveChallenge(await nfd.get(stateKey, { type: 'json' }), uid, state.id)) {
-    return verifyResponse(409, { ok: false, error: 'invalid_challenge' })
-  }
-  if (await nfd.get('isblocked-' + uid, { type: 'json' }) || await isTemporarilyRestricted(uid)) {
-    return verifyResponse(403, { ok: false, error: 'blocked' })
+  if (!isActiveChallenge(currentState, uid, state.id)) return
+  if (await isTemporarilyRestricted(uid)) return
+  if (!correct) {
+    state = { ...state, failures, blockedUntil }
+    await markStateCompleted(stateKey, state, `captcha wrong answer for UID ${uid}`)
+    await sendMessage({ chat_id: message.chat.id, text: '验证码不正确，请回复新图片重新输入。再输错一次将限制 1 小时。' })
+    await ensureCaptcha(message)
+    return
   }
 
   const grant = await saveVerificationSession(uid, state.id)
   if (!grant) {
     await markStateCompleted(stateKey, state, `captcha state for UID ${uid}`)
-    await sendMessage({
-      chat_id: state.chatId,
-      text: '验证结果保存失败，原消息尚未发送。请重新发送一条消息以再次验证。'
-    })
-    return verifyResponse(503, { ok: false, error: 'verification_unavailable' })
+    await sendMessage({ chat_id: state.chatId, text: '验证结果保存失败，原消息尚未发送。请重新发送一条消息以再次验证。' })
+    return
   }
   if (await nfd.get('isblocked-' + uid, { type: 'json' })) {
     await revokeVisitorAccess(uid)
-    return verifyResponse(403, { ok: false, error: 'blocked' })
+    return
   }
   if (await isTemporarilyRestricted(uid)) {
     await revokeVerificationGrant(uid, grant)
-    return verifyResponse(403, { ok: false, error: 'blocked' })
+    return
   }
   if (!isActiveChallenge(await nfd.get(stateKey, { type: 'json' }), uid, state.id)) {
     await revokeVerificationGrant(uid, grant)
-    return verifyResponse(409, { ok: false, error: 'invalid_challenge' })
+    return
   }
   const pendingKey = 'pending-message-' + uid
   const pending = await nfd.get(pendingKey, { type: 'json' })
@@ -739,20 +862,16 @@ async function completeVerification (request, config, uid, body) {
     pending.chatId?.toString() === uid && Number.isInteger(pending.messageId) &&
     state.pendingChatId === pending.chatId && state.pendingMessageId === pending.messageId &&
     state.pendingExpiresAt === pending.expiresAt
-  let forwarded = false
   let resultText = '✅ 验证成功，24 小时内可直接发送消息。请发送您的问题。'
   if (pendingMatches) {
-    const forwardResult = await forwardGuestMessage(
+    const result = await forwardGuestMessage(
       pending.chatId, pending.messageId, verificationDeliveryContext('verification_pass', grant)
     )
-    forwarded = forwardResult.forwarded
-    resultText = forwarded
+    resultText = result.forwarded
       ? '✅ 验证成功，您的消息已发送，24 小时内可继续发送消息。验证期间的其他消息请重新发送。'
       : '✅ 验证成功，但原消息发送失败，请重新发送一次。'
-    if (forwarded) {
-      try {
-        await handleNotify({ chat: { id: pending.chatId } })
-      } catch (_) {
+    if (result.forwarded) {
+      try { await handleNotify({ chat: { id: pending.chatId } }) } catch (_) {
         console.error(`fraud notification failed for UID ${uid}`)
       }
     }
@@ -762,128 +881,26 @@ async function completeVerification (request, config, uid, body) {
     pendingMatches ? markStateCompleted(pendingKey, pending, `pending message for UID ${uid}`) : Promise.resolve(false)
   ])
   await sendMessage({ chat_id: state.chatId, text: resultText })
-  return verifyResponse(200, { ok: true, status: 'verified', forwarded })
-}
-
-async function handleVerifyComplete (request) {
-  if (request.method !== 'POST') return verifyResponse(405, { ok: false, error: 'method_not_allowed' }, { Allow: 'POST' })
-  const config = getVerificationConfig()
-  if (!config) return verifyResponse(503, { ok: false, error: 'verification_unavailable' })
-  if (!isVerificationOrigin(request, config)) return verifyResponse(403, { ok: false, error: 'invalid_origin' })
-  let body
-  try {
-    body = await readVerifyBody(request)
-  } catch (_) {
-    return verifyResponse(400, { ok: false, error: 'malformed_request' })
-  }
-  if (typeof body.initData !== 'string' || !body.initData || body.initData.length > 8192 ||
-    typeof body.challengeId !== 'string' || !CHALLENGE_ID_PATTERN.test(body.challengeId) ||
-    typeof body.turnstileToken !== 'string' || !body.turnstileToken || body.turnstileToken.length > 2048) {
-    return verifyResponse(400, { ok: false, error: 'malformed_request' })
-  }
-  const identity = await validateTelegramInitData(body.initData)
-  if (!identity) return verifyResponse(401, { ok: false, error: 'invalid_identity' })
-  const previous = verificationQueues.get(body.challengeId) || Promise.resolve()
-  const current = previous.catch(() => {}).then(() => completeVerification(request, config, identity.userId, body))
-  verificationQueues.set(body.challengeId, current)
-  try {
-    return await current
-  } catch (_) {
-    console.error('Verification completion failed')
-    return verifyResponse(503, { ok: false, error: 'verification_unavailable' })
-  } finally {
-    if (verificationQueues.get(body.challengeId) === current) verificationQueues.delete(body.challengeId)
-  }
-}
-
-function handleVerifyPage (request) {
-  if (request.method !== 'GET') return verifyResponse(405, { ok: false, error: 'method_not_allowed' }, { Allow: 'GET' })
-  const config = getVerificationConfig()
-  if (!config) return verifyResponse(503, { ok: false, error: 'verification_unavailable' })
-  if (!isVerificationOrigin(request, config)) return verifyResponse(403, { ok: false, error: 'invalid_origin' })
-  const params = new URL(request.url).searchParams
-  const challengeId = params.get('challenge')
-  if (params.getAll('challenge').length !== 1 || !challengeId || !CHALLENGE_ID_PATTERN.test(challengeId)) {
-    return verifyResponse(400, { ok: false, error: 'malformed_request' })
-  }
-  const nonce = crypto.randomUUID().replace(/-/g, '')
-  const pageConfig = JSON.stringify({ siteKey: config.siteKey, challengeId, action: TURNSTILE_ACTION }).replace(/</g, '\\u003c')
-  const html = `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>安全验证</title>
-<style nonce="${nonce}">:root{color-scheme:light dark}body{margin:0;padding:28px 18px;font:16px/1.6 system-ui,sans-serif;background:#f5f7fb;color:#152238}main{max-width:420px;margin:24px auto;padding:26px;background:#fff;border-radius:16px}h1{font-size:23px;margin:0 0 12px}p{color:#526177}#widget{min-height:75px;margin:20px 0}button{padding:11px 18px;border:0;border-radius:9px;background:#2463eb;color:#fff;font:inherit;cursor:pointer}button[hidden]{display:none}@media(prefers-color-scheme:dark){body{background:#121824;color:#edf2fc}main{background:#1c2636}p{color:#b1bfd5}}</style>
-<script nonce="${nonce}" src="https://telegram.org/js/telegram-web-app.js"></script></head>
-<body><main><h1>安全验证</h1><p>完成验证后，回到机器人即可继续交流。</p><div id="widget"></div><p id="status" role="status">正在加载验证…</p><button id="retry" hidden>重新验证</button><button id="close" hidden>返回机器人</button></main>
-<script nonce="${nonce}">
-'use strict';
-const config = ${pageConfig};
-const app = window.Telegram && window.Telegram.WebApp;
-const initData = app && app.initData;
-const statusNode = document.getElementById('status');
-const retryButton = document.getElementById('retry');
-const closeButton = document.getElementById('close');
-let widgetId;
-let busy = false;
-let turnstileReady = false;
-function showError(text) { statusNode.textContent = text; retryButton.hidden = widgetId === undefined; }
-retryButton.addEventListener('click', () => { if (!busy && widgetId !== undefined) { retryButton.hidden = true; statusNode.textContent = '请完成安全验证。'; window.turnstile.reset(widgetId); } });
-closeButton.addEventListener('click', () => { if (app) app.close(); });
-if (app) { app.ready(); app.expand(); }
-setTimeout(function () {
-  if (!turnstileReady) {
-    showError('验证服务加载失败，请检查网络后回到机器人重新打开。');
-    closeButton.hidden = !app;
-  }
-}, 15000);
-window.onTurnstileReady = function () {
-  turnstileReady = true;
-  if (!initData) { showError('请关闭本页，在 Telegram 机器人中点击“开始安全验证”重新打开。'); return; }
-  statusNode.textContent = '请完成安全验证。';
-  widgetId = window.turnstile.render('#widget', {
-    sitekey: config.siteKey, action: config.action, cData: config.challengeId,
-    callback: async function (token) {
-      if (busy) return;
-      busy = true; retryButton.hidden = true; statusNode.textContent = '正在确认验证结果…';
-      try {
-        const response = await fetch('/verify/complete', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({initData:initData,challengeId:config.challengeId,turnstileToken:token}) });
-        const result = await response.json();
-        if (!response.ok || !result.ok) {
-          const messages = {invalid_identity:'身份信息已过期，请回到机器人重新打开验证。',invalid_challenge:'验证入口已过期或已使用，请回到机器人重新发送消息。',already_processing:'验证正在处理或入口已使用，请稍后返回机器人；需要时重新发送消息。',blocked:'当前账号暂时无法发送消息。',verification_unavailable:'验证暂时不可用，请回到机器人重新发送消息后再试。'};
-          showError(messages[result.error] || '安全验证未通过，请重试。');
-          return;
-        }
-        statusNode.textContent = result.forwarded ? '验证完成，首条消息已发送。等待期间的其他消息，请回到机器人重新发送。' : '验证完成，请回到机器人发送您的消息。';
-        closeButton.hidden = false;
-      } catch (_) { showError('连接失败，请重试；如果已经收到验证成功提示，可直接返回机器人。'); }
-      finally { busy = false; }
-    },
-    'error-callback': function () { showError('验证服务暂时不可用，请重试。'); },
-    'expired-callback': function () { showError('验证已过期，请重新验证。'); }
-  });
-};
-</script><script nonce="${nonce}" src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onTurnstileReady&amp;render=explicit" async defer></script></body></html>`
-  return new Response(html, {
-    headers: {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'no-store',
-      'Referrer-Policy': 'no-referrer',
-      'X-Content-Type-Options': 'nosniff',
-      'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${nonce}' https://telegram.org https://challenges.cloudflare.com; style-src 'unsafe-inline'; frame-src https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; img-src data: https://challenges.cloudflare.com; base-uri 'none'; form-action 'none'`
-    }
-  })
 }
 
 async function onCallbackQuery (query) {
-  // Legacy emoji buttons only receive an acknowledgement. They can never grant
-  // the new verification session, including challenges left over after rollout.
+  // Legacy buttons only receive an acknowledgement and cannot grant the new
+  // image-verification session.
   await answerCallbackQuery(query.id)
 }
 
 async function isTemporarilyRestricted (uid) {
-  return Boolean(
-    await nfd.get('captcha-block-' + uid, { type: 'json' }) ||
-    await nfd.get('rate-block-' + uid, { type: 'json' })
-  )
+  const [captchaBlock, rateBlock, state, claim] = await Promise.all([
+    nfd.get('captcha-block-' + uid, { type: 'json' }),
+    nfd.get('rate-block-' + uid, { type: 'json' }),
+    nfd.get('captcha-' + uid, { type: 'json' }),
+    getCaptchaAttempt(uid)
+  ])
+  const activeCaptchaBlock = captchaBlock === true ||
+    (Number.isFinite(captchaBlock?.blockedUntil) && captchaBlock.blockedUntil > Date.now())
+  return Boolean(activeCaptchaBlock || rateBlock ||
+    (Number.isFinite(state?.blockedUntil) && state.blockedUntil > Date.now()) ||
+    (Number.isFinite(claim?.blockedUntil) && claim.blockedUntil > Date.now()))
 }
 
 async function isRateLimited (uid) {
@@ -971,7 +988,7 @@ async function forwardGuestMessage (chatId, messageId, deliveryContext = { reaso
     reason,
     decidedAt,
     deliveredAt: Date.now(),
-    verificationMethod: deliveryContext.verificationMethod === 'turnstile' ? 'turnstile' : null,
+    verificationMethod: deliveryContext.verificationMethod === 'image' ? 'image' : null,
     verifiedAt: Number.isFinite(deliveryContext.verifiedAt) ? deliveryContext.verifiedAt : null,
     verificationExpiresAt: Number.isFinite(deliveryContext.verificationExpiresAt) ? deliveryContext.verificationExpiresAt : null,
     trustedAt: Number.isFinite(deliveryContext.trustedAt) ? deliveryContext.trustedAt : null
@@ -1060,7 +1077,7 @@ async function checkUser (message) {
   const reasons = {
     trusted: '永久信任名单内',
     verified_window: '24 小时验证有效期内',
-    verification_pass: '本次 Turnstile 安全验证通过',
+    verification_pass: '本次图片验证码通过',
     unknown: '未知'
   }
   const lines = [`UID:${uid}`]
