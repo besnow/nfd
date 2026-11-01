@@ -5,44 +5,26 @@ const ADMIN_UID = ENV_ADMIN_UID.toString() // your user id, get it from https://
 
 const CAPTCHA_TTL_SECONDS = 10 * 60
 const CAPTCHA_PROCESSING_TIMEOUT_MS = 30 * 1000
-const CAPTCHA_BLOCK_SECONDS = 60 * 60
-const CAPTCHA_ROUNDS = 2
-const CAPTCHA_MAX_FAILURES = 2
-const CAPTCHA_VERSION = 2
-const VERIFIED_VERSION = 3
+const CAPTCHA_VERSION = 3
+const VERIFIED_VERSION = 4
 const VERIFIED_TTL_SECONDS = 24 * 60 * 60
 const SPAM_FINGERPRINT_TTL_SECONDS = 30 * 24 * 60 * 60
 const RATE_BLOCK_SECONDS = 24 * 60 * 60
+const DELIVERY_AUDIT_TTL_SECONDS = 30 * 24 * 60 * 60
+const TURNSTILE_ACTION = 'nfd_verify'
+const INIT_DATA_MAX_AGE_SECONDS = 10 * 60
+const VERIFY_BODY_MAX_BYTES = 16384
+const CHALLENGE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const TURNSTILE_SITE_KEY = typeof ENV_TURNSTILE_SITE_KEY === 'string' ? ENV_TURNSTILE_SITE_KEY.trim() : ''
+const TURNSTILE_SECRET_KEY = typeof ENV_TURNSTILE_SECRET_KEY === 'string' ? ENV_TURNSTILE_SECRET_KEY.trim() : ''
+const PUBLIC_URL = typeof ENV_PUBLIC_URL === 'string' ? ENV_PUBLIC_URL.trim() : ''
 const fraudDb = 'https://raw.githubusercontent.com/LloydAsp/nfd/main/data/fraud.db'
-const startMsgUrl = 'https://raw.githubusercontent.com/besnow/nfd/main/data/startMessage.md'
-const adminMsgUrl = 'https://raw.githubusercontent.com/besnow/nfd/main/data/adminMessage.md'
+const startMsgUrl = 'https://raw.githubusercontent.com/besnow/nfd/main/data/startMessage.v4.md'
+const adminMsgUrl = 'https://raw.githubusercontent.com/besnow/nfd/main/data/adminMessage.v4.md'
 
 const pendingSaveQueues = new Map()
 const captchaCreationQueues = new Map()
-
-const CAPTCHA_ICONS = [
-  { label: '苹果', icon: '🍎' }, { label: '香蕉', icon: '🍌' },
-  { label: '葡萄', icon: '🍇' }, { label: '西瓜', icon: '🍉' },
-  { label: '草莓', icon: '🍓' }, { label: '樱桃', icon: '🍒' },
-  { label: '汉堡', icon: '🍔' }, { label: '披萨', icon: '🍕' },
-  { label: '蛋糕', icon: '🍰' }, { label: '足球', icon: '⚽' },
-  { label: '篮球', icon: '🏀' }, { label: '汽车', icon: '🚗' },
-  { label: '公交车', icon: '🚌' }, { label: '飞机', icon: '✈️' },
-  { label: '火箭', icon: '🚀' }, { label: '房子', icon: '🏠' },
-  { label: '太阳', icon: '☀️' }, { label: '月亮', icon: '🌙' },
-  { label: '星星', icon: '⭐' }, { label: '雨伞', icon: '☂️' },
-  { label: '钥匙', icon: '🔑' }, { label: '电话', icon: '☎️' },
-  { label: '灯泡', icon: '💡' }, { label: '书本', icon: '📘' },
-  { label: '铅笔', icon: '✏️' }, { label: '礼物', icon: '🎁' },
-  { label: '气球', icon: '🎈' }, { label: '爱心', icon: '❤️' },
-  { label: '火焰', icon: '🔥' }, { label: '雪花', icon: '❄️' },
-  { label: '小狗', icon: '🐶' }, { label: '小猫', icon: '🐱' },
-  { label: '熊', icon: '🐻' }, { label: '熊猫', icon: '🐼' },
-  { label: '青蛙', icon: '🐸' }, { label: '狮子', icon: '🦁' },
-  { label: '猴子', icon: '🐵' }, { label: '小鸡', icon: '🐥' },
-  { label: '企鹅', icon: '🐧' }, { label: '鲸鱼', icon: '🐳' },
-  { label: '章鱼', icon: '🐙' }, { label: '蝴蝶', icon: '🦋' }
-]
+const verificationQueues = new Map()
 
 function apiUrl (methodName, params = null) {
   let query = ''
@@ -86,7 +68,11 @@ function deleteMessage (msg) {
 
 addEventListener('fetch', event => {
   const url = new URL(event.request.url)
-  if (url.pathname === WEBHOOK) {
+  if (url.pathname === '/verify') {
+    event.respondWith(handleVerifyPage(event.request))
+  } else if (url.pathname === '/verify/complete') {
+    event.respondWith(handleVerifyComplete(event.request))
+  } else if (url.pathname === WEBHOOK) {
     event.respondWith(handleWebhook(event))
   } else if (url.pathname === '/registerWebhook') {
     event.respondWith(registerWebhook(event, url, WEBHOOK, SECRET))
@@ -128,10 +114,14 @@ async function onMessage (message) {
     return sendMessage({ chat_id: message.chat.id, text: startMsg })
   }
 
-  if (await nfd.get('trusted-' + uid, { type: 'json' })) {
-    return handleGuestMessage(message)
+  const trust = await nfd.get('trusted-' + uid, { type: 'json' })
+  if (trust) {
+    return handleGuestMessage(message, {
+      reason: 'trusted', decidedAt: Date.now(), trustedAt: trust.trustedAt || null
+    })
   }
-  if (await isVerified(uid)) return handleGuestMessage(message)
+  const verification = await getVerifiedSession(uid)
+  if (verification) return handleGuestMessage(message, verificationDeliveryContext('verified_window', verification))
 
   const fingerprint = await getMessageFingerprint(message)
   if (fingerprint && await nfd.get('spam-fingerprint-' + fingerprint, { type: 'json' })) {
@@ -145,30 +135,63 @@ async function onMessage (message) {
   await ensureCaptcha(message, pending)
 }
 
-async function isVerified (uid) {
+async function getVerifiedSession (uid) {
   const state = await nfd.get('verified-' + uid, { type: 'json' })
-  return state?.version === VERIFIED_VERSION &&
-    Number.isFinite(state.expiresAt) && state.expiresAt > Date.now()
+  return state?.version === VERIFIED_VERSION && state.method === 'turnstile' &&
+    Number.isFinite(state.expiresAt) && state.expiresAt > Date.now() ? state : null
 }
 
-async function saveVerificationSession (uid) {
+async function isVerified (uid) {
+  return Boolean(await getVerifiedSession(uid))
+}
+
+function verificationDeliveryContext (reason, state) {
+  return {
+    reason,
+    decidedAt: Date.now(),
+    verificationMethod: state.method,
+    verifiedAt: state.verifiedAt,
+    verificationExpiresAt: state.expiresAt
+  }
+}
+
+async function saveVerificationSession (uid, challengeId) {
   const verifiedAt = Date.now()
   const state = {
     version: VERIFIED_VERSION,
+    method: 'turnstile',
+    challengeId,
     verifiedAt,
     expiresAt: verifiedAt + VERIFIED_TTL_SECONDS * 1000
   }
-  // Do not forward until the verification grant has been saved. The timestamp
-  // is fixed here; subsequent visitor messages never extend this session.
+  // The fixed timestamp never changes on subsequent visitor messages.
   for (let attempt = 1; attempt <= 3; attempt++) {
     if (attempt > 1) await wait(1100)
     try {
       await nfd.put('verified-' + uid, JSON.stringify(state), {
         expirationTtl: VERIFIED_TTL_SECONDS
       })
-      return true
+      return state
     } catch (error) {
       if (attempt === 3) console.error(`verification grant write failed for UID ${uid}: ${error}`)
+    }
+  }
+  return null
+}
+
+async function revokeVerificationGrant (uid, grant) {
+  const key = 'verified-' + uid
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (attempt > 1) await wait(1100)
+    try {
+      const current = await nfd.get(key, { type: 'json' })
+      if (!current || current.version !== grant.version || current.method !== grant.method ||
+        current.challengeId !== grant.challengeId || current.verifiedAt !== grant.verifiedAt ||
+        current.expiresAt !== grant.expiresAt) return true
+      await nfd.delete(key)
+      return true
+    } catch (_) {
+      if (attempt === 3) console.error(`verification rollback failed for UID ${uid}`)
     }
   }
   return false
@@ -199,12 +222,13 @@ async function handleAdminMessage (message) {
   if (!message?.reply_to_message?.chat) {
     return sendMessage({
       chat_id: ADMIN_UID,
-      text: '使用方法，回复转发的消息，并发送回复消息，或者`/block`、`/unblock`、`/checkblock`等指令'
+      text: '使用方法，回复转发的消息，并发送回复消息，或者`/block`、`/unblock`、`/checkblock`、`/checkuser`等指令'
     })
   }
   if (/^\/block$/.exec(message.text)) return handleBlock(message)
   if (/^\/unblock$/.exec(message.text)) return handleUnBlock(message)
   if (/^\/checkblock$/.exec(message.text)) return checkBlock(message)
+  if (/^\/checkuser$/.exec(message.text)) return checkUser(message)
 
   const guestChatId = await nfd.get('msg-map-' + message.reply_to_message.message_id, { type: 'json' })
   if (!guestChatId) {
@@ -267,37 +291,33 @@ async function silentlyBlockKnownSpam (uid) {
   }
 }
 
-function shuffle (values) {
-  const result = [...values]
-  for (let i = result.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1))
-    ;[result[i], result[j]] = [result[j], result[i]]
+function getVerificationConfig () {
+  if (!TURNSTILE_SITE_KEY || !TURNSTILE_SECRET_KEY || !PUBLIC_URL) return null
+  try {
+    const url = new URL(PUBLIC_URL)
+    if (url.protocol !== 'https:' || url.username || url.password ||
+      url.pathname !== '/' || url.search || url.hash) return null
+    return {
+      siteKey: TURNSTILE_SITE_KEY,
+      secretKey: TURNSTILE_SECRET_KEY,
+      origin: url.origin,
+      hostname: url.hostname
+    }
+  } catch (_) {
+    return null
   }
-  return result
 }
 
-function captchaText (challenge) {
-  return `为防止自动广告，请连续完成两次简单验证。\n\n第 ${challenge.round}/${CAPTCHA_ROUNDS} 次：请选择「${challenge.targetLabel}」`
-}
-
-function createCaptcha (userId, chatId, failures = 0, messageId = null, expiresAt = null, round = 1) {
+function createCaptcha (userId, chatId, messageId = null, expiresAt = null, pending = null) {
   const now = Date.now()
-  const target = CAPTCHA_ICONS[Math.floor(Math.random() * CAPTCHA_ICONS.length)]
-  const distractors = shuffle(CAPTCHA_ICONS.filter(item => item.icon !== target.icon)).slice(0, 5)
-  const options = shuffle([target, ...distractors]).map((item, index) => ({
-    id: index.toString(),
-    icon: item.icon
-  }))
-  const correctOptionId = options.find(option => option.icon === target.icon).id
   return {
     id: crypto.randomUUID(),
-    userId,
+    userId: userId.toString(),
     version: CAPTCHA_VERSION,
-    round,
-    targetLabel: target.label,
-    options,
-    correctOptionId,
-    failures,
+    method: 'turnstile',
+    pendingChatId: pending?.chatId ?? null,
+    pendingMessageId: pending?.messageId ?? null,
+    pendingExpiresAt: pending?.expiresAt ?? null,
     status: 'active',
     createdAt: now,
     expiresAt: expiresAt || now + CAPTCHA_TTL_SECONDS * 1000,
@@ -307,12 +327,14 @@ function createCaptcha (userId, chatId, failures = 0, messageId = null, expiresA
   }
 }
 
-function captchaKeyboard (challenge) {
-  const buttons = challenge.options.map(option => ({
-    text: option.icon,
-    callback_data: `captcha:${challenge.id}:${option.id}`
-  }))
-  return { inline_keyboard: [buttons.slice(0, 3), buttons.slice(3, 6)] }
+function captchaText () {
+  return '为防止自动广告，请点击下方按钮完成安全验证。验证通过后，首条消息会自动发送；等待期间的其他消息请在通过后重新发送。'
+}
+
+function captchaKeyboard (challenge, config) {
+  const url = new URL('/verify', config.origin)
+  url.searchParams.set('challenge', challenge.id)
+  return { inline_keyboard: [[{ text: '开始安全验证', web_app: { url: url.toString() } }]] }
 }
 
 function remainingTtl (expiresAt) {
@@ -390,6 +412,10 @@ async function markStateCompleted (key, state, label) {
     chatId: state.chatId,
     messageId: state.messageId,
     createdAt: state.createdAt,
+    method: state.method,
+    pendingChatId: state.pendingChatId,
+    pendingMessageId: state.pendingMessageId,
+    pendingExpiresAt: state.pendingExpiresAt,
     completedAt: Date.now(),
     expiresAt: state.expiresAt,
     writtenAt: Date.now()
@@ -400,6 +426,14 @@ async function markStateCompleted (key, state, label) {
       completed.writtenAt = Date.now()
     }
     try {
+      const current = await nfd.get(key, { type: 'json' })
+      const sameGeneration = current && (state.id
+        ? current.id === state.id
+        : current.chatId === state.chatId && current.messageId === state.messageId && current.expiresAt === state.expiresAt)
+      // State can expire, be revoked, or be replaced during a retry. Never
+      // resurrect old records or complete a different pending message.
+      if (!sameGeneration) return false
+      if (current.status === 'completed') return true
       await nfd.put(key, JSON.stringify(completed), {
         expirationTtl: remainingTtl(state.expiresAt) || 60
       })
@@ -412,11 +446,12 @@ async function markStateCompleted (key, state, label) {
 }
 
 async function sendAndStoreCaptcha (key, challenge) {
-  if (remainingTtl(challenge.expiresAt) <= 0) return false
+  const config = getVerificationConfig()
+  if (!config || remainingTtl(challenge.expiresAt) <= 0) return false
   const response = await sendMessage({
     chat_id: challenge.chatId,
     text: captchaText(challenge),
-    reply_markup: captchaKeyboard(challenge)
+    reply_markup: captchaKeyboard(challenge, config)
   })
   if (response?.ok !== true || !response.result?.message_id) return false
   const ttl = remainingTtl(challenge.expiresAt)
@@ -458,12 +493,16 @@ async function writeCaptchaClaim (state, uid, claimedAt) {
 
 async function ensureCaptcha (message, pending = null) {
   const uid = message.from.id.toString()
+  if (!getVerificationConfig()) {
+    await sendMessage({ chat_id: message.chat.id, text: '安全验证暂不可用，消息尚未发送，请稍后重试。' })
+    return
+  }
   const previous = captchaCreationQueues.get(uid) || Promise.resolve()
   const current = previous.then(async () => {
     const key = 'captcha-' + uid
     const existing = await nfd.get(key, { type: 'json' })
     const now = Date.now()
-    if (existing?.version === CAPTCHA_VERSION && existing.status === 'active' && existing.messageId && existing.expiresAt > now) {
+    if (existing?.version === CAPTCHA_VERSION && existing.method === 'turnstile' && existing.status === 'active' && existing.messageId && existing.expiresAt > now) {
       const claim = await nfd.get('captcha-claim-' + existing.id, { type: 'json' })
       if (!claim || now - claim.claimedAt <= CAPTCHA_PROCESSING_TIMEOUT_MS) return
       await waitForCaptchaWrite(existing)
@@ -471,12 +510,12 @@ async function ensureCaptcha (message, pending = null) {
       await waitForCaptchaWrite(existing)
     }
 
+    const currentPending = pending || await nfd.get('pending-message-' + uid, { type: 'json' })
     const continuesActiveSession = existing?.status === 'active' && existing.expiresAt > now
     const expiresAt = continuesActiveSession
       ? existing.expiresAt
-      : pending?.expiresAt > now ? pending.expiresAt : now + CAPTCHA_TTL_SECONDS * 1000
-    const failures = continuesActiveSession ? existing.failures || 0 : 0
-    const challenge = createCaptcha(uid, message.chat.id, failures, null, expiresAt, 1)
+      : currentPending?.expiresAt > now ? currentPending.expiresAt : now + CAPTCHA_TTL_SECONDS * 1000
+    const challenge = createCaptcha(uid, message.chat.id, null, expiresAt, currentPending)
     await sendAndStoreCaptcha(key, challenge)
   })
   captchaCreationQueues.set(uid, current)
@@ -487,111 +526,357 @@ async function ensureCaptcha (message, pending = null) {
   }
 }
 
-async function onCallbackQuery (query) {
+function verifyResponse (status, body, extraHeaders = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Referrer-Policy': 'no-referrer',
+      'X-Content-Type-Options': 'nosniff',
+      ...extraHeaders
+    }
+  })
+}
+
+function isVerificationOrigin (request, config) {
   try {
-    if (query.message?.chat?.type !== 'private') return
-
-    const uid = query.from.id.toString()
-    if (uid === ADMIN_UID) return
-    if (await nfd.get('isblocked-' + uid, { type: 'json' })) return
-    if (await isTemporarilyRestricted(uid)) return
-
-    const stateKey = 'captcha-' + uid
-    const state = await nfd.get(stateKey, { type: 'json' })
-    if (!state || state.version !== CAPTCHA_VERSION || state.status !== 'active' || !state.messageId || state.expiresAt <= Date.now()) return
-    if (state.userId?.toString() !== uid) return
-    if (state.chatId.toString() !== query.message.chat.id.toString() || state.messageId !== query.message.message_id) return
-
-    const parts = (query.data || '').split(':')
-    if (parts.length !== 3 || parts[0] !== 'captcha' || parts[1] !== state.id) return
-    const selectedOption = state.options.find(option => option.id === parts[2])
-    if (!selectedOption) return
-
-    let deleted
-    try {
-      deleted = await deleteMessage({
-        chat_id: state.chatId,
-        message_id: state.messageId
-      })
-    } catch (error) {
-      console.error(`captcha claim delete failed: ${error}`)
-      return
-    }
-    if (deleted?.ok !== true) return
-
-    const claimedAt = Date.now()
-    await writeCaptchaClaim(state, uid, claimedAt)
-
-    if (selectedOption.id !== state.correctOptionId) {
-      const failures = state.failures + 1
-      if (failures >= CAPTCHA_MAX_FAILURES) {
-        await nfd.put('captcha-block-' + uid, 'true', { expirationTtl: CAPTCHA_BLOCK_SECONDS })
-        await sendMessage({ chat_id: state.chatId, text: '验证失败次数过多，请 1 小时后再试。' })
-        return
-      }
-
-      const ttl = remainingTtl(state.expiresAt)
-      if (ttl <= 0) return
-      await waitForCaptchaWrite(state)
-      const replacement = createCaptcha(uid, state.chatId, failures, null, state.expiresAt, 1)
-      await sendAndStoreCaptcha(stateKey, replacement)
-      return
-    }
-
-    if (state.round < CAPTCHA_ROUNDS) {
-      const ttl = remainingTtl(state.expiresAt)
-      if (ttl <= 0) return
-      await waitForCaptchaWrite(state)
-      const replacement = createCaptcha(uid, state.chatId, state.failures, null, state.expiresAt, state.round + 1)
-      await sendAndStoreCaptcha(stateKey, replacement)
-      return
-    }
-
-    // A visitor may have been blocked while answering the challenge.
-    if (await nfd.get('isblocked-' + uid, { type: 'json' })) return
-    if (await isTemporarilyRestricted(uid)) return
-    if (!await saveVerificationSession(uid)) {
-      await markStateCompleted(stateKey, state, `captcha state for UID ${uid}`)
-      await sendMessage({
-        chat_id: state.chatId,
-        text: '验证结果保存失败，原消息尚未发送。请重新发送一条消息以再次验证。'
-      })
-      return
-    }
-    if (await nfd.get('isblocked-' + uid, { type: 'json' })) {
-      await revokeVisitorAccess(uid)
-      return
-    }
-    if (await isTemporarilyRestricted(uid)) return
-
-    const pendingKey = 'pending-message-' + uid
-    const pending = await nfd.get(pendingKey, { type: 'json' })
-    let resultText = '✅ 验证成功，24 小时内可直接发送消息。请发送您的问题。'
-    if (pending && pending.status !== 'completed' && pending.expiresAt > Date.now() &&
-      pending.chatId?.toString() === uid && Number.isInteger(pending.messageId)) {
-      const forwardResult = await forwardGuestMessage(pending.chatId, pending.messageId)
-      if (forwardResult.forwarded) {
-        resultText = '✅ 验证成功，您的消息已发送，24 小时内可继续发送消息。验证期间的其他消息请重新发送。'
-      } else {
-        resultText = '✅ 验证成功，但原消息发送失败，请重新发送一次。'
-      }
-      if (forwardResult.forwarded) {
-        try {
-          await handleNotify({ chat: { id: pending.chatId } })
-        } catch (error) {
-          console.log(`handleNotify failed: ${error}`)
-        }
-      }
-    }
-    await Promise.allSettled([
-      markStateCompleted(stateKey, state, `captcha state for UID ${uid}`),
-      markStateCompleted(pendingKey, pending, `pending message for UID ${uid}`)
-    ])
-    await sendMessage({ chat_id: state.chatId, text: resultText })
-  } finally {
-    // Telegram requires every callback to be acknowledged, including ignored stale callbacks.
-    await answerCallbackQuery(query.id)
+    return new URL(request.url).origin === config.origin &&
+      (!request.headers.get('Origin') || request.headers.get('Origin') === config.origin)
+  } catch (_) {
+    return false
   }
+}
+
+async function hmacSha256 (key, value) {
+  const encoder = new TextEncoder()
+  const imported = await crypto.subtle.importKey(
+    'raw', typeof key === 'string' ? encoder.encode(key) : key,
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  )
+  return new Uint8Array(await crypto.subtle.sign('HMAC', imported, encoder.encode(value)))
+}
+
+async function validateTelegramInitData (raw) {
+  if (typeof raw !== 'string' || !raw || raw.length > 8192) return null
+  try {
+    const params = new URLSearchParams(raw)
+    const seen = new Set()
+    const fields = []
+    for (const [key, value] of params) {
+      if (seen.has(key)) return null
+      seen.add(key)
+      if (key !== 'hash') fields.push([key, value])
+    }
+    const hash = params.get('hash')
+    if (!hash || !/^[a-f0-9]{64}$/i.test(hash)) return null
+    fields.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+    // HMAC validation excludes hash only. Telegram's optional signature remains
+    // part of this string (the Ed25519 validation rules are different).
+    const dataCheckString = fields.map(([key, value]) => `${key}=${value}`).join('\n')
+    const secretKey = await hmacSha256('WebAppData', TOKEN)
+    const expected = await hmacSha256(secretKey, dataCheckString)
+    const supplied = new Uint8Array(hash.match(/../g).map(byte => parseInt(byte, 16)))
+    let difference = 0
+    for (let index = 0; index < expected.length; index++) difference |= expected[index] ^ supplied[index]
+    if (difference !== 0) return null
+
+    const authDateRaw = params.get('auth_date')
+    if (!authDateRaw || !/^\d{1,12}$/.test(authDateRaw)) return null
+    const authDate = Number(authDateRaw)
+    const now = Math.floor(Date.now() / 1000)
+    if (!Number.isSafeInteger(authDate) || now - authDate > INIT_DATA_MAX_AGE_SECONDS || authDate - now > 30) return null
+    const user = JSON.parse(params.get('user'))
+    if (!user || typeof user !== 'object' || Array.isArray(user) ||
+      !Number.isSafeInteger(user.id) || user.id <= 0 || user.is_bot === true) return null
+    return { userId: user.id.toString(), authDate }
+  } catch (_) {
+    return null
+  }
+}
+
+async function readVerifyBody (request) {
+  if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get('Content-Type') || '')) throw new Error('invalid content type')
+  if (!request.body) throw new Error('missing body')
+  const reader = request.body.getReader()
+  const chunks = []
+  let length = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      length += value.byteLength
+      if (length > VERIFY_BODY_MAX_BYTES) {
+        await reader.cancel()
+        throw new Error('body too large')
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const bytes = new Uint8Array(length)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  const body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes))
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('invalid body')
+  return body
+}
+
+async function verifyTurnstileToken (token, challengeId, request, config = getVerificationConfig()) {
+  if (!config || typeof token !== 'string' || !token || token.length > 2048) return false
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 10000)
+  try {
+    const body = { secret: config.secretKey, response: token }
+    const ip = request.headers.get('CF-Connecting-IP')
+    if (ip) body.remoteip = ip
+    const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    })
+    if (!response.ok) return false
+    const result = await response.json()
+    return result?.success === true && result.hostname === config.hostname &&
+      result.action === TURNSTILE_ACTION && result.cdata === challengeId
+  } catch (_) {
+    // Never log the submitted token, signed Telegram data, or secret.
+    console.error('Turnstile verification request failed')
+    return false
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function isActiveChallenge (state, uid, challengeId) {
+  return state?.version === CAPTCHA_VERSION && state.method === 'turnstile' &&
+    state.id === challengeId && state.userId?.toString() === uid &&
+    state.chatId?.toString() === uid && state.status === 'active' &&
+    Number.isInteger(state.messageId) && state.messageId > 0 &&
+    Number.isFinite(state.expiresAt) && state.expiresAt > Date.now()
+}
+
+async function completeVerification (request, config, uid, body) {
+  if (uid === ADMIN_UID || await nfd.get('isblocked-' + uid, { type: 'json' }) || await isTemporarilyRestricted(uid)) {
+    return verifyResponse(403, { ok: false, error: 'blocked' })
+  }
+  const stateKey = 'captcha-' + uid
+  let state = await nfd.get(stateKey, { type: 'json' })
+  if (!isActiveChallenge(state, uid, body.challengeId)) return verifyResponse(409, { ok: false, error: 'invalid_challenge' })
+  if (await nfd.get('captcha-claim-' + state.id, { type: 'json' })) {
+    return verifyResponse(409, { ok: false, error: 'already_processing' })
+  }
+  if (!await verifyTurnstileToken(body.turnstileToken, state.id, request, config)) {
+    return verifyResponse(403, { ok: false, error: 'turnstile_failed' })
+  }
+
+  // Siteverify may take time. Re-read identity-bound state and restrictions
+  // before claiming the attempt; never trust stale browser-supplied state.
+  state = await nfd.get(stateKey, { type: 'json' })
+  if (!isActiveChallenge(state, uid, body.challengeId)) return verifyResponse(409, { ok: false, error: 'invalid_challenge' })
+  if (await nfd.get('isblocked-' + uid, { type: 'json' }) || await isTemporarilyRestricted(uid)) {
+    return verifyResponse(403, { ok: false, error: 'blocked' })
+  }
+  if (await nfd.get('captcha-claim-' + state.id, { type: 'json' })) {
+    return verifyResponse(409, { ok: false, error: 'already_processing' })
+  }
+  // Persist a recovery lease before consuming the Telegram button. A failed
+  // claim leaves the button usable; an abandoned lease can be renewed by
+  // ensureCaptcha after 30 seconds. KV/deleteMessage are best-effort deduplication,
+  // not a cross-instance atomic transaction.
+  if (!await writeCaptchaClaim(state, uid, Date.now())) {
+    return verifyResponse(503, { ok: false, error: 'verification_unavailable' })
+  }
+  if (!isActiveChallenge(await nfd.get(stateKey, { type: 'json' }), uid, state.id)) {
+    return verifyResponse(409, { ok: false, error: 'invalid_challenge' })
+  }
+  if (await nfd.get('isblocked-' + uid, { type: 'json' }) || await isTemporarilyRestricted(uid)) {
+    return verifyResponse(403, { ok: false, error: 'blocked' })
+  }
+  let deleted
+  try {
+    deleted = await deleteMessage({ chat_id: state.chatId, message_id: state.messageId })
+  } catch (_) {
+    return verifyResponse(503, { ok: false, error: 'verification_unavailable' })
+  }
+  if (deleted?.ok !== true) return verifyResponse(409, { ok: false, error: 'already_processing' })
+  if (!isActiveChallenge(await nfd.get(stateKey, { type: 'json' }), uid, state.id)) {
+    return verifyResponse(409, { ok: false, error: 'invalid_challenge' })
+  }
+  if (await nfd.get('isblocked-' + uid, { type: 'json' }) || await isTemporarilyRestricted(uid)) {
+    return verifyResponse(403, { ok: false, error: 'blocked' })
+  }
+
+  const grant = await saveVerificationSession(uid, state.id)
+  if (!grant) {
+    await markStateCompleted(stateKey, state, `captcha state for UID ${uid}`)
+    await sendMessage({
+      chat_id: state.chatId,
+      text: '验证结果保存失败，原消息尚未发送。请重新发送一条消息以再次验证。'
+    })
+    return verifyResponse(503, { ok: false, error: 'verification_unavailable' })
+  }
+  if (await nfd.get('isblocked-' + uid, { type: 'json' })) {
+    await revokeVisitorAccess(uid)
+    return verifyResponse(403, { ok: false, error: 'blocked' })
+  }
+  if (await isTemporarilyRestricted(uid)) {
+    await revokeVerificationGrant(uid, grant)
+    return verifyResponse(403, { ok: false, error: 'blocked' })
+  }
+  if (!isActiveChallenge(await nfd.get(stateKey, { type: 'json' }), uid, state.id)) {
+    await revokeVerificationGrant(uid, grant)
+    return verifyResponse(409, { ok: false, error: 'invalid_challenge' })
+  }
+  const pendingKey = 'pending-message-' + uid
+  const pending = await nfd.get(pendingKey, { type: 'json' })
+  const pendingMatches = pending && pending.status !== 'completed' && pending.expiresAt > Date.now() &&
+    pending.chatId?.toString() === uid && Number.isInteger(pending.messageId) &&
+    state.pendingChatId === pending.chatId && state.pendingMessageId === pending.messageId &&
+    state.pendingExpiresAt === pending.expiresAt
+  let forwarded = false
+  let resultText = '✅ 验证成功，24 小时内可直接发送消息。请发送您的问题。'
+  if (pendingMatches) {
+    const forwardResult = await forwardGuestMessage(
+      pending.chatId, pending.messageId, verificationDeliveryContext('verification_pass', grant)
+    )
+    forwarded = forwardResult.forwarded
+    resultText = forwarded
+      ? '✅ 验证成功，您的消息已发送，24 小时内可继续发送消息。验证期间的其他消息请重新发送。'
+      : '✅ 验证成功，但原消息发送失败，请重新发送一次。'
+    if (forwarded) {
+      try {
+        await handleNotify({ chat: { id: pending.chatId } })
+      } catch (_) {
+        console.error(`fraud notification failed for UID ${uid}`)
+      }
+    }
+  }
+  await Promise.allSettled([
+    markStateCompleted(stateKey, state, `captcha state for UID ${uid}`),
+    pendingMatches ? markStateCompleted(pendingKey, pending, `pending message for UID ${uid}`) : Promise.resolve(false)
+  ])
+  await sendMessage({ chat_id: state.chatId, text: resultText })
+  return verifyResponse(200, { ok: true, status: 'verified', forwarded })
+}
+
+async function handleVerifyComplete (request) {
+  if (request.method !== 'POST') return verifyResponse(405, { ok: false, error: 'method_not_allowed' }, { Allow: 'POST' })
+  const config = getVerificationConfig()
+  if (!config) return verifyResponse(503, { ok: false, error: 'verification_unavailable' })
+  if (!isVerificationOrigin(request, config)) return verifyResponse(403, { ok: false, error: 'invalid_origin' })
+  let body
+  try {
+    body = await readVerifyBody(request)
+  } catch (_) {
+    return verifyResponse(400, { ok: false, error: 'malformed_request' })
+  }
+  if (typeof body.initData !== 'string' || !body.initData || body.initData.length > 8192 ||
+    typeof body.challengeId !== 'string' || !CHALLENGE_ID_PATTERN.test(body.challengeId) ||
+    typeof body.turnstileToken !== 'string' || !body.turnstileToken || body.turnstileToken.length > 2048) {
+    return verifyResponse(400, { ok: false, error: 'malformed_request' })
+  }
+  const identity = await validateTelegramInitData(body.initData)
+  if (!identity) return verifyResponse(401, { ok: false, error: 'invalid_identity' })
+  const previous = verificationQueues.get(body.challengeId) || Promise.resolve()
+  const current = previous.catch(() => {}).then(() => completeVerification(request, config, identity.userId, body))
+  verificationQueues.set(body.challengeId, current)
+  try {
+    return await current
+  } catch (_) {
+    console.error('Verification completion failed')
+    return verifyResponse(503, { ok: false, error: 'verification_unavailable' })
+  } finally {
+    if (verificationQueues.get(body.challengeId) === current) verificationQueues.delete(body.challengeId)
+  }
+}
+
+function handleVerifyPage (request) {
+  if (request.method !== 'GET') return verifyResponse(405, { ok: false, error: 'method_not_allowed' }, { Allow: 'GET' })
+  const config = getVerificationConfig()
+  if (!config) return verifyResponse(503, { ok: false, error: 'verification_unavailable' })
+  if (!isVerificationOrigin(request, config)) return verifyResponse(403, { ok: false, error: 'invalid_origin' })
+  const params = new URL(request.url).searchParams
+  const challengeId = params.get('challenge')
+  if (params.getAll('challenge').length !== 1 || !challengeId || !CHALLENGE_ID_PATTERN.test(challengeId)) {
+    return verifyResponse(400, { ok: false, error: 'malformed_request' })
+  }
+  const nonce = crypto.randomUUID().replace(/-/g, '')
+  const pageConfig = JSON.stringify({ siteKey: config.siteKey, challengeId, action: TURNSTILE_ACTION }).replace(/</g, '\\u003c')
+  const html = `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>安全验证</title>
+<style nonce="${nonce}">:root{color-scheme:light dark}body{margin:0;padding:28px 18px;font:16px/1.6 system-ui,sans-serif;background:#f5f7fb;color:#152238}main{max-width:420px;margin:24px auto;padding:26px;background:#fff;border-radius:16px}h1{font-size:23px;margin:0 0 12px}p{color:#526177}#widget{min-height:75px;margin:20px 0}button{padding:11px 18px;border:0;border-radius:9px;background:#2463eb;color:#fff;font:inherit;cursor:pointer}button[hidden]{display:none}@media(prefers-color-scheme:dark){body{background:#121824;color:#edf2fc}main{background:#1c2636}p{color:#b1bfd5}}</style>
+<script nonce="${nonce}" src="https://telegram.org/js/telegram-web-app.js"></script></head>
+<body><main><h1>安全验证</h1><p>完成验证后，回到机器人即可继续交流。</p><div id="widget"></div><p id="status" role="status">正在加载验证…</p><button id="retry" hidden>重新验证</button><button id="close" hidden>返回机器人</button></main>
+<script nonce="${nonce}">
+'use strict';
+const config = ${pageConfig};
+const app = window.Telegram && window.Telegram.WebApp;
+const initData = app && app.initData;
+const statusNode = document.getElementById('status');
+const retryButton = document.getElementById('retry');
+const closeButton = document.getElementById('close');
+let widgetId;
+let busy = false;
+let turnstileReady = false;
+function showError(text) { statusNode.textContent = text; retryButton.hidden = widgetId === undefined; }
+retryButton.addEventListener('click', () => { if (!busy && widgetId !== undefined) { retryButton.hidden = true; statusNode.textContent = '请完成安全验证。'; window.turnstile.reset(widgetId); } });
+closeButton.addEventListener('click', () => { if (app) app.close(); });
+if (app) { app.ready(); app.expand(); }
+setTimeout(function () {
+  if (!turnstileReady) {
+    showError('验证服务加载失败，请检查网络后回到机器人重新打开。');
+    closeButton.hidden = !app;
+  }
+}, 15000);
+window.onTurnstileReady = function () {
+  turnstileReady = true;
+  if (!initData) { showError('请关闭本页，在 Telegram 机器人中点击“开始安全验证”重新打开。'); return; }
+  statusNode.textContent = '请完成安全验证。';
+  widgetId = window.turnstile.render('#widget', {
+    sitekey: config.siteKey, action: config.action, cData: config.challengeId,
+    callback: async function (token) {
+      if (busy) return;
+      busy = true; retryButton.hidden = true; statusNode.textContent = '正在确认验证结果…';
+      try {
+        const response = await fetch('/verify/complete', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({initData:initData,challengeId:config.challengeId,turnstileToken:token}) });
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          const messages = {invalid_identity:'身份信息已过期，请回到机器人重新打开验证。',invalid_challenge:'验证入口已过期或已使用，请回到机器人重新发送消息。',already_processing:'验证正在处理或入口已使用，请稍后返回机器人；需要时重新发送消息。',blocked:'当前账号暂时无法发送消息。',verification_unavailable:'验证暂时不可用，请回到机器人重新发送消息后再试。'};
+          showError(messages[result.error] || '安全验证未通过，请重试。');
+          return;
+        }
+        statusNode.textContent = result.forwarded ? '验证完成，首条消息已发送。等待期间的其他消息，请回到机器人重新发送。' : '验证完成，请回到机器人发送您的消息。';
+        closeButton.hidden = false;
+      } catch (_) { showError('连接失败，请重试；如果已经收到验证成功提示，可直接返回机器人。'); }
+      finally { busy = false; }
+    },
+    'error-callback': function () { showError('验证服务暂时不可用，请重试。'); },
+    'expired-callback': function () { showError('验证已过期，请重新验证。'); }
+  });
+};
+</script><script nonce="${nonce}" src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onTurnstileReady&amp;render=explicit" async defer></script></body></html>`
+  return new Response(html, {
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Referrer-Policy': 'no-referrer',
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${nonce}' https://telegram.org https://challenges.cloudflare.com; style-src 'unsafe-inline'; frame-src https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; img-src data: https://challenges.cloudflare.com; base-uri 'none'; form-action 'none'`
+    }
+  })
+}
+
+async function onCallbackQuery (query) {
+  // Legacy emoji buttons only receive an acknowledgement. They can never grant
+  // the new verification session, including challenges left over after rollout.
+  await answerCallbackQuery(query.id)
 }
 
 async function isTemporarilyRestricted (uid) {
@@ -641,12 +926,28 @@ async function isRateLimited (uid) {
   return true
 }
 
-async function handleGuestMessage (message) {
-  const result = await forwardGuestMessage(message.chat.id, message.message_id)
+async function handleGuestMessage (message, deliveryContext = { reason: 'unknown' }) {
+  const result = await forwardGuestMessage(message.chat.id, message.message_id, deliveryContext)
   if (result.forwarded) return handleNotify(message)
 }
 
-async function forwardGuestMessage (chatId, messageId) {
+async function saveDeliveryRecord (key, value, options, label) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (attempt > 1) await wait(1100)
+    try {
+      await nfd.put(key, value, options)
+      return true
+    } catch (_) {
+      if (attempt === 3) console.error(`${label} write failed after 3 attempts`)
+    }
+  }
+  return false
+}
+
+async function forwardGuestMessage (chatId, messageId, deliveryContext = { reason: 'unknown' }) {
+  const allowedReasons = ['trusted', 'verified_window', 'verification_pass']
+  const reason = allowedReasons.includes(deliveryContext.reason) ? deliveryContext.reason : 'unknown'
+  const decidedAt = Number.isFinite(deliveryContext.decidedAt) ? deliveryContext.decidedAt : Date.now()
   let forwardReq
   try {
     forwardReq = await forwardMessage({
@@ -654,28 +955,37 @@ async function forwardGuestMessage (chatId, messageId) {
       from_chat_id: chatId,
       message_id: messageId
     })
-  } catch (error) {
-    console.error(`forwardMessage failed for UID ${chatId}: ${error}`)
-    return { forwarded: false, mapped: false, adminMessageId: null }
+  } catch (_) {
+    console.error(`forwardMessage failed for UID ${chatId}`)
+    return { forwarded: false, mapped: false, audited: false, adminMessageId: null }
   }
-  console.log(JSON.stringify(forwardReq))
   const adminMessageId = forwardReq?.result?.message_id
   if (forwardReq?.ok !== true || !Number.isInteger(adminMessageId)) {
-    return { forwarded: false, mapped: false, adminMessageId: null }
+    return { forwarded: false, mapped: false, audited: false, adminMessageId: null }
   }
-
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    if (attempt > 1) await wait(1100)
-    try {
-      await nfd.put('msg-map-' + adminMessageId, chatId.toString())
-      return { forwarded: true, mapped: true, adminMessageId }
-    } catch (error) {
-      if (attempt === 3) {
-        console.error(`msg-map write failed after 3 attempts for UID ${chatId}, admin message ${adminMessageId}: ${error}`)
-      }
-    }
+  const audit = {
+    version: 1,
+    uid: chatId.toString(),
+    sourceMessageId: messageId,
+    adminMessageId,
+    reason,
+    decidedAt,
+    deliveredAt: Date.now(),
+    verificationMethod: deliveryContext.verificationMethod === 'turnstile' ? 'turnstile' : null,
+    verifiedAt: Number.isFinite(deliveryContext.verifiedAt) ? deliveryContext.verifiedAt : null,
+    verificationExpiresAt: Number.isFinite(deliveryContext.verificationExpiresAt) ? deliveryContext.verificationExpiresAt : null,
+    trustedAt: Number.isFinite(deliveryContext.trustedAt) ? deliveryContext.trustedAt : null
   }
-  return { forwarded: true, mapped: false, adminMessageId }
+  // Mapping and historical evidence are separate writes. Failure of either
+  // never retries Telegram delivery and therefore never duplicates the message.
+  const [mapped, audited] = await Promise.all([
+    saveDeliveryRecord('msg-map-' + adminMessageId, chatId.toString(), undefined, `mapping for ${adminMessageId}`),
+    saveDeliveryRecord('delivery-audit-' + adminMessageId, JSON.stringify(audit), {
+      expirationTtl: DELIVERY_AUDIT_TTL_SECONDS
+    }, `delivery audit for ${adminMessageId}`)
+  ])
+  console.log(JSON.stringify({ event: 'message_delivered', uid: audit.uid, sourceMessageId: messageId, adminMessageId, reason, mapped, audited }))
+  return { forwarded: true, mapped, audited, adminMessageId }
 }
 
 async function handleNotify (message) {
@@ -726,6 +1036,51 @@ async function checkBlock (message) {
   return sendMessage({ chat_id: ADMIN_UID, text: `UID:${guestChatId}${blocked ? '被屏蔽' : '没有被屏蔽'}` })
 }
 
+function formatAuditTime (timestamp) {
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : '未知'
+}
+
+async function checkUser (message) {
+  const adminMessageId = message.reply_to_message.message_id
+  const [mapping, storedAudit] = await Promise.all([
+    nfd.get('msg-map-' + adminMessageId, { type: 'json' }),
+    nfd.get('delivery-audit-' + adminMessageId, { type: 'json' })
+  ])
+  const audit = storedAudit?.version === 1 && storedAudit.adminMessageId === adminMessageId &&
+    typeof storedAudit.uid === 'string' && /^[1-9]\d*$/.test(storedAudit.uid) ? storedAudit : null
+  const uid = mapping ? mapping.toString() : audit?.uid
+  if (!uid) return sendMessage({ chat_id: ADMIN_UID, text: '找不到该消息对应的用户，也没有可用的投递记录。' })
+  const [blocked, temporary, trust, verification] = await Promise.all([
+    nfd.get('isblocked-' + uid, { type: 'json' }),
+    isTemporarilyRestricted(uid),
+    nfd.get('trusted-' + uid, { type: 'json' }),
+    getVerifiedSession(uid)
+  ])
+  const history = audit?.uid === uid ? audit : null
+  const reasons = {
+    trusted: '永久信任名单内',
+    verified_window: '24 小时验证有效期内',
+    verification_pass: '本次 Turnstile 安全验证通过',
+    unknown: '未知'
+  }
+  const lines = [`UID:${uid}`]
+  if (history) {
+    lines.push(`这条消息当时的投递原因：${reasons[history.reason] || '未知'}`)
+    lines.push(`投递时间：${formatAuditTime(history.deliveredAt)}`)
+    if (history.verificationMethod) lines.push(`当时验证方式：${history.verificationMethod}`)
+    if (history.verifiedAt) lines.push(`当时验证时间：${formatAuditTime(history.verifiedAt)}`)
+    if (history.verificationExpiresAt) lines.push(`当时验证到期：${formatAuditTime(history.verificationExpiresAt)}`)
+    if (history.trustedAt) lines.push(`当时信任时间：${formatAuditTime(history.trustedAt)}`)
+  } else {
+    lines.push('这条消息当时的投递原因：未知（旧消息、记录已过期或当时未能保存）')
+  }
+  lines.push(`当前封禁：${blocked ? '已永久屏蔽' : '未屏蔽'}`)
+  lines.push(`当前临时限制：${temporary ? '限制中' : '无'}`)
+  lines.push(`当前永久信任：${trust ? `已信任，信任时间 ${formatAuditTime(trust.trustedAt)}` : '未信任'}`)
+  lines.push(`当前验证资格：${verification ? `验证有效，直到 ${formatAuditTime(verification.expiresAt)}` : '未验证或已过期'}`)
+  return sendMessage({ chat_id: ADMIN_UID, text: lines.join('\n') })
+}
+
 function rejectManagementRequest (request) {
   if (request.method !== 'POST') {
     return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } })
@@ -755,8 +1110,5 @@ async function isFraud (id) {
   id = id.toString()
   const db = await fetch(fraudDb).then(r => r.text())
   const arr = db.split('\n').filter(v => v)
-  console.log(JSON.stringify(arr))
-  const flag = arr.filter(v => v === id).length !== 0
-  console.log(flag)
-  return flag
+  return arr.includes(id)
 }
